@@ -1,0 +1,121 @@
+local flow = require("ludobits.m.flow")
+local live_unbundler = require("live_unbundler.live_unbundler")
+
+go.property("collectionproxy1", msg.url())
+go.property("collectionproxy2", msg.url())
+go.property("collectionproxy3", msg.url())
+
+local function get_modules()
+	local load_table = {}
+	local priority = 1
+	local function add_load_item(key, files, res_mode, by_request)
+		assert(
+			res_mode
+				and type(res_mode) == "number"
+				and (
+					res_mode ~= live_unbundler.RES_HIGH_ONLY
+					or res_mode ~= live_unbundler.RES_LOW_ONLY
+					or res_mode ~= live_unbundler.RES_BOTH
+				),
+			"Resolution mode is required and must be a number between "
+				.. live_unbundler.RES_HIGH_ONLY
+				.. " and "
+				.. live_unbundler.RES_BOTH
+				.. ", got "
+				.. tostring(res_mode)
+		)
+		priority = priority + 1
+		load_table[key] = {
+			priority = priority,
+			files = files,
+			res_mode = res_mode,
+			by_request = by_request,
+		}
+	end
+
+	add_load_item("one_collection", {
+		"collection3.collectionc",
+	}, live_unbundler.RES_HIGH_ONLY)
+
+	add_load_item("two_collections", {
+		"collection1.collectionc",
+		"collection2.collectionc",
+	}, live_unbundler.RES_BOTH)
+
+	return load_table
+end
+
+local function get_save_file(filename)
+	local bundle_identifier = sys.get_config("project.bundle_identifier")
+	return sys.get_save_file(bundle_identifier, filename)
+end
+
+local function init_live_unbundler(self)
+	local modules = get_modules()
+
+	local version = sys.get_config_string("project.version")
+
+	local server_url = "."
+	local server_path = server_url == "." and "." or string.format("%s/%s", server_url, version)
+
+	local lowres_path = string.format("%s%s", server_path, "/liveupdatelowres/")
+	local hires_path = string.format("%s%s", server_path, "/liveupdatehighres/")
+
+	local value, error_msg = flow.until_callback(function(cb)
+		live_unbundler.init(
+			{
+				modules = modules,
+				lowres_server_path = lowres_path,
+				hires_server_path = hires_path, --optional
+				disabled = false, -- optional, for example, for android PAD
+				save_cache_key = get_save_file("liveupdate_saved_files"),
+			},
+			cb,
+			function(module_name)
+				return true
+			end
+		)
+	end)
+end
+
+function init(self)
+	live_unbundler.add_listener()
+
+	flow.start(function()
+		init_live_unbundler(self)
+		while not live_unbundler.is_module_loaded("two_collections") do
+			flow.delay(0.1)
+		end
+		msg.post(self.collectionproxy1, "load")
+		msg.post(self.collectionproxy2, "load")
+		while not live_unbundler.is_module_loaded("one_collection") do
+			flow.delay(0.1)
+		end
+		msg.post(self.collectionproxy3, "load")
+	end)
+end
+
+local function unload_proxy(self, proxy)
+	msg.post(proxy, "disable")
+	msg.post(proxy, "final")
+	msg.post(proxy, "unload")
+end
+
+function on_message(self, message_id, message, sender)
+	pprint(message_id, message, sender)
+	if message_id == hash("proxy_loaded") then
+		msg.post(sender, "init")
+		msg.post(sender, "enable")
+	elseif message_id == live_unbundler.MSG_ALL_LOADED then
+		unload_proxy(self, self.collectionproxy1)
+		unload_proxy(self, self.collectionproxy2)
+		timer.delay(0.1, false, function()
+			msg.post(self.collectionproxy1, "load")
+			msg.post(self.collectionproxy2, "load")
+		end)
+	end
+end
+
+function final(self)
+	live_unbundler.remove_listener()
+end

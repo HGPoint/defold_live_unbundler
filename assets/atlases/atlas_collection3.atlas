@@ -1,0 +1,4 @@
+images {
+  image: "/assets/images/logo-ver-classic-white_text.png"
+}
+extrude_borders: 2

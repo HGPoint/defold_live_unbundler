@@ -1,0 +1,7 @@
+/.editor_settings
+/.internal
+/build
+/dist
+.DS_Store
+Thumbs.db
+/tools/__pycache__

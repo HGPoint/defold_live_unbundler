@@ -1,0 +1,4 @@
+images {
+  image: "/assets/images/logo-ver-classic-dark_tagline.png"
+}
+extrude_borders: 2
