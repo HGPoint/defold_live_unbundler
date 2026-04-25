@@ -433,7 +433,9 @@ class PackContext:
     def create_collection_archives(self):
         print("Starting zip file collection")
         for path in self.zip_files:
-            zip_file_name = os.path.basename(self.files[path]["children"][0])
+            zip_file_name = os.path.splitext(
+                os.path.basename(self.files[path]["children"][0])
+            )[0]
             files_list = list(self.zip_files[path].keys())
             texture_files = [f for f in files_list if self.is_texture_resource(f)]
             other_files = [f for f in files_list if not self.is_texture_resource(f)]
@@ -465,7 +467,7 @@ class PackContext:
 
         archive_deps = {}
         for filepath, archives in self.dependency_list.items():
-            file_name = os.path.basename(filepath)
+            file_name = os.path.splitext(os.path.basename(filepath))[0]
             for archive in archives:
                 archive_deps.setdefault(archive, []).append(file_name)
 

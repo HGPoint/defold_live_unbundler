@@ -65,10 +65,12 @@ All resources outside the main bundle are split into four archive classes:
 
 | Prefix | Contents |
 | --- | --- |
-| `<collection>.collectionc`        | non-texture resources of a specific collection-proxy |
-| `<collection>.collectionc_texture`| textures (`.texturec`, `.a.texturesetc`) of that collection |
-| `common_<hash>`                   | non-texture resources shared by ≥ 2 collections |
-| `common_texture_<hash>`           | shared textures used by ≥ 2 collections |
+| `<collection>`            | non-texture resources of a specific collection-proxy |
+| `<collection>_texture`    | textures (`.texturec`, `.a.texturesetc`) of that collection |
+| `common_<hash>`           | non-texture resources shared by ≥ 2 collections |
+| `common_texture_<hash>`   | shared textures used by ≥ 2 collections |
+
+The `.collectionc` extension is stripped from archive names — both the keys in `manifest.json` and the file names on the CDN use the bare collection name.
 
 Logic:
 
@@ -105,13 +107,13 @@ The first `HASH_LEN = 16` hex characters are kept. The same string is used in:
 {
   "version": "1777019959",
   "collections": [
-    "baking_festival_window.collectionc",
-    "baking_festival_info_window.collectionc",
+    "baking_festival_window",
+    "baking_festival_info_window",
     ...
   ],
   "files": {
-    "baking_festival_window.collectionc": ["a3e317707f7a3947"],
-    "common_texture_ad6d67fefa501371":   ["21f9526418de6268", [0, 1, 5, 7]],
+    "baking_festival_window":          ["a3e317707f7a3947"],
+    "common_texture_ad6d67fefa501371": ["21f9526418de6268", [0, 1, 5, 7]],
     ...
   },
   "dmanifest_info": { ... }

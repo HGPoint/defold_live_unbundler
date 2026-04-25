@@ -738,10 +738,8 @@ local function check_modules_integrity(modules, manifest)
 
 	for file_name, _ in pairs(highres_collections) do
 		if all_module_files[file_name] == nil and not highres_deps[file_name] then
-			local error_text = string.format(
-				"The manifest lists a file that is not present in the modules. File: %s.collectionc",
-				file_name
-			)
+			local error_text =
+				string.format("The manifest lists a file that is not present in the modules. File: %s", file_name)
 			log.warn(error_text)
 			downloadable_missing_files[file_name] = error_text
 		end
@@ -765,12 +763,7 @@ end
 local function schedule_retry_or_drop(load_info, load_resources, reason)
 	load_info.attempts = (load_info.attempts or 0) + 1
 	if load_info.attempts >= max_item_attempts then
-		log.error(
-			"Giving up on %s after %d attempts (%s)",
-			load_info.file_name,
-			max_item_attempts,
-			reason
-		)
+		log.error("Giving up on %s after %d attempts (%s)", load_info.file_name, max_item_attempts, reason)
 		downloadable_missing_files[load_info.file_name] =
 			string.format("Failed after %d attempts: %s", max_item_attempts, reason)
 		drop_queue_item(load_info)

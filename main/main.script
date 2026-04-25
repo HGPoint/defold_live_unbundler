@@ -4,6 +4,7 @@ local live_unbundler = require("live_unbundler.live_unbundler")
 go.property("collectionproxy1", msg.url())
 go.property("collectionproxy2", msg.url())
 go.property("collectionproxy3", msg.url())
+go.property("collectionproxy4", msg.url())
 
 local function get_modules()
 	local load_table = {}
@@ -33,14 +34,18 @@ local function get_modules()
 		}
 	end
 
+	add_load_item("two_collections", {
+		"collection1",
+		"collection2",
+	}, live_unbundler.RES_BOTH)
+
 	add_load_item("one_collection", {
-		"collection3.collectionc",
+		"collection3",
 	}, live_unbundler.RES_HIGH_ONLY)
 
-	add_load_item("two_collections", {
-		"collection1.collectionc",
-		"collection2.collectionc",
-	}, live_unbundler.RES_BOTH)
+	add_load_item("request_collection", {
+		"collection4",
+	}, live_unbundler.RES_HIGH_ONLY, true)
 
 	return load_table
 end
@@ -79,6 +84,7 @@ local function init_live_unbundler(self)
 end
 
 function init(self)
+	pprint("main.init")
 	live_unbundler.add_listener()
 
 	flow.start(function()
@@ -88,10 +94,20 @@ function init(self)
 		end
 		msg.post(self.collectionproxy1, "load")
 		msg.post(self.collectionproxy2, "load")
+
 		while not live_unbundler.is_module_loaded("one_collection") do
 			flow.delay(0.1)
 		end
 		msg.post(self.collectionproxy3, "load")
+		if not live_unbundler.is_module_loaded("request_collection") then
+			flow.delay(5)
+
+			live_unbundler.request_module_load("request_collection")
+			while not live_unbundler.is_module_loaded("request_collection") do
+				flow.delay(0.1)
+			end
+		end
+		msg.post(self.collectionproxy4, "load")
 	end)
 end
 
@@ -103,10 +119,15 @@ end
 
 function on_message(self, message_id, message, sender)
 	pprint(message_id, message, sender)
+	flow.on_message(message_id, message, sender)
 	if message_id == hash("proxy_loaded") then
 		msg.post(sender, "init")
 		msg.post(sender, "enable")
 	elseif message_id == live_unbundler.MSG_ALL_LOADED then
+		if self.reloaded then
+			return
+		end
+		self.reloaded = true
 		unload_proxy(self, self.collectionproxy1)
 		unload_proxy(self, self.collectionproxy2)
 		timer.delay(0.1, false, function()

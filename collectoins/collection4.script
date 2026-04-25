@@ -1,0 +1,3 @@
+function init(self)
+	print("col4 loaded")
+end

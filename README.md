@@ -76,7 +76,7 @@ live_unbundler.init({
     modules = {
         my_module = {
             priority = 1,
-            files = { "my_collection.collectionc" },
+            files = { "my_collection" }, -- collection name without any extension
             res_mode = live_unbundler.RES_BOTH,
         },
     },

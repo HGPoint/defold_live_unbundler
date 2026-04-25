@@ -1,0 +1,34 @@
+images {
+  image: "/assets/images/logo-hor-classic-bright.png"
+}
+images {
+  image: "/assets/images/logo-hor-classic-dark.png"
+}
+images {
+  image: "/assets/images/logo-ver-classic-dark_tagline.png"
+}
+images {
+  image: "/assets/images/logo-ver-classic-white.png"
+}
+images {
+  image: "/assets/images/logo-ver-classic-white_text.png"
+}
+images {
+  image: "/builtins/assets/images/logo/logo_256.png"
+}
+images {
+  image: "/builtins/assets/images/logo/logo_blue_256.png"
+}
+images {
+  image: "/builtins/assets/images/logo/logo_blue_512.png"
+}
+images {
+  image: "/builtins/assets/images/logo/logo_blue_1024.png"
+}
+images {
+  image: "/builtins/graphics/particle_blob.png"
+}
+images {
+  image: "/logo.png"
+}
+extrude_borders: 2

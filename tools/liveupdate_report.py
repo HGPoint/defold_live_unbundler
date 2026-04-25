@@ -165,7 +165,7 @@ def render_interactive_html(files_tree):
   <h1>Liveupdate Common Report</h1>
   <div class=\"controls\">
     <div>Collections (comma-separated):</div>
-    <textarea id=\"collections\" placeholder=\"lobby_scene.collectionc,card_collection_window.collectionc\"></textarea>
+    <textarea id=\"collections\" placeholder=\"lobby_scene,card_collection_window\"></textarea>
     <button class=\"button\" id=\"run\">Build Report</button>
   </div>
   <div class=\"meta\" id=\"meta\"></div>
