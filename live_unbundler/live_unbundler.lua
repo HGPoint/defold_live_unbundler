@@ -42,6 +42,7 @@ local log = {
 ---@field remount boolean?
 ---@field order integer?
 ---@field reason string?
+---@field attempts integer?
 
 ---@class liveupdater.check_result
 ---@field files_to_remove table<string, string>
@@ -137,6 +138,10 @@ local local_folder = "liveupdate_zip"
 
 ---@type integer
 local max_attempts = 3
+---@type integer
+local max_item_attempts = 3
+---@type number
+local retry_delay = 5
 
 ---@type table<string, liveupdater.file_progress>
 local downloadable_files = {}
@@ -744,6 +749,38 @@ local function check_modules_integrity(modules, manifest)
 end
 
 ---@param load_info liveupdater.queue_item
+local function drop_queue_item(load_info)
+	download_queue_index[load_info.file_name .. ":" .. load_info.version] = nil
+	for index, value in ipairs(download_files_queue) do
+		if value == load_info then
+			table.remove(download_files_queue, index)
+			break
+		end
+	end
+end
+
+---@param load_info liveupdater.queue_item
+---@param load_resources fun()
+---@param reason string
+local function schedule_retry_or_drop(load_info, load_resources, reason)
+	load_info.attempts = (load_info.attempts or 0) + 1
+	if load_info.attempts >= max_item_attempts then
+		log.error(
+			"Giving up on %s after %d attempts (%s)",
+			load_info.file_name,
+			max_item_attempts,
+			reason
+		)
+		downloadable_missing_files[load_info.file_name] =
+			string.format("Failed after %d attempts: %s", max_item_attempts, reason)
+		drop_queue_item(load_info)
+		load_resources()
+	else
+		timer.delay(retry_delay, false, load_resources)
+	end
+end
+
+---@param load_info liveupdater.queue_item
 ---@param load_resources fun()
 local function add_mount(load_info, load_resources)
 	mount_resource(load_info.file_name, function(success)
@@ -779,7 +816,7 @@ local function add_mount(load_info, load_resources)
 			end
 		else
 			log.error("Unable to mount file %s", load_info.file_name)
-			timer.delay(5, false, load_resources)
+			schedule_retry_or_drop(load_info, load_resources, "mount failed")
 		end
 	end)
 end
@@ -796,11 +833,11 @@ local function handle_load_info_callback(success, data, load_info, load_resource
 			add_mount(load_info, load_resources)
 		else
 			log.error("Unable to save file %s: %s", load_info.file_name, err)
-			timer.delay(5, false, load_resources)
+			schedule_retry_or_drop(load_info, load_resources, string.format("save failed: %s", tostring(err)))
 		end
 	else
 		notify_event_listeners(M.MSG_NETWORK_ERROR)
-		timer.delay(5, false, load_resources)
+		schedule_retry_or_drop(load_info, load_resources, "network error")
 	end
 end
 

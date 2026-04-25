@@ -19,12 +19,12 @@ buildliveupdatehighres: $(BOB_FILE)
 		--texture-compression true \
 		--bundle-output dist \
 		--build-report-html build/report.html \
-		--variant release \
+		--variant debug \
 		--archive \
 		--platform js-web \
 		--use-async-build-server \
 		--liveupdate yes \
-		resolve clean distclean build bundle
+		resolve build bundle
 	@echo "Build liveupdate"
 	@rm -rf "dist/output/$(VERSION_NUMBER)/liveupdatehighres"
 	@unzip -o -q "liveupdate_dist/*.zip" -d "liveupdate_dist/"
@@ -36,7 +36,6 @@ buildliveupdatehighres: $(BOB_FILE)
 
 buildliveupdatelowres: $(BOB_FILE)
 	@rm -rf liveupdate_dist
-	@rm -rf build
 	@echo "Build liveupdate lowres"
 	@rm -rf "liveupdate_dist"
 	@java -jar $(BOB_FILE) \
@@ -45,12 +44,12 @@ buildliveupdatelowres: $(BOB_FILE)
 		--texture-compression true \
 		--bundle-output dist \
 		--build-report-html build/report.html \
-		--variant release \
+		--variant debug \
 		--archive \
 		--platform js-web \
 		--use-async-build-server \
 		--liveupdate yes \
-		resolve clean distclean build bundle
+		resolve build bundle
 	@echo "Build liveupdate"
 	@rm -rf "dist/output/$(VERSION_NUMBER)/liveupdatelowres"
 	@unzip -o -q "liveupdate_dist/*.zip" -d "liveupdate_dist/"
@@ -64,7 +63,6 @@ buildliveupdateres:
 	@echo "Build liveupdate resources"
 	@rm -rf liveupdate_dist
 	@rm -rf liveupdate_zip
-	@rm -rf build
 	@rm -rf dist/output
 	@mkdir -p dist/output
 	@rm -rf "dist/output/$(VERSION_NUMBER)/"
@@ -83,7 +81,7 @@ buildweb: $(BOB_FILE)
 		--platform js-web \
 		--use-async-build-server \
 		--liveupdate yes \
-		resolve clean distclean build bundle
+		resolve build bundle
 	@echo 'Result: "dist/defold_live_unbundler/index.html"'
 	@echo "Report: build/report.html"
 
