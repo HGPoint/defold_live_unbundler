@@ -370,8 +370,9 @@ end
 ---@param filename string
 ---@return boolean
 local function is_mount_exist(filename)
+	local name = hash(filename)
 	for _, mount in ipairs(liveupdate.get_mounts()) do
-		if mount.name == filename then
+		if mount.name == name then
 			return true
 		end
 	end
@@ -631,8 +632,9 @@ end
 ---@param file_name string
 ---@return boolean
 local function remove_mount_and_local_file(file_name)
+	local name = hash(file_name)
 	for _, mount in ipairs(liveupdate.get_mounts()) do
-		if mount.name == file_name then
+		if mount.name == name then
 			if liveupdate.remove_mount(file_name) == liveupdate.LIVEUPDATE_OK then
 				break
 			else
