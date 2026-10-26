@@ -175,6 +175,11 @@ class PackContext:
                         self.dependency_list[main_file].append(common_files_list_name)
 
     def create_zip_archive(self, zip_name, files_list, common_files_list_name=None):
+        # Dependencies are grouped by resource path, but distinct paths can have
+        # identical bytes. Deduplicate only inside this archive: skipping a hash
+        # written to another archive would leave consumers without its payload.
+        # This also keeps restored highres/lowres layouts independently loadable.
+        self.added_files = {}
         common_zip_name = zip_name
         zip_name = zip_name + self.temp_suffix
         zip_path = os.path.join(self.result_folder, zip_name + self.extension_archive)
@@ -274,8 +279,8 @@ class PackContext:
 
         # Several paths may legitimately resolve to the same content (same
         # hexDigest) - e.g. an identical font shipped under two folders. We do
-        # not abort on that: the bytes are stored once (deduped by hexDigest in
-        # add_files_to_zip) while each path keeps its own manifest entry.
+        # not abort on that: the bytes are stored once per archive (deduped by
+        # hexDigest in add_files_to_zip) while each path keeps its manifest entry.
         duplicates_map = {}
         for element in data:
             hex_digest = element.get("hexDigest")
@@ -284,7 +289,7 @@ class PackContext:
                     print(
                         f"Note: shared hexDigest {hex_digest} for "
                         f"{duplicates_map[hex_digest]} and {element['path']} "
-                        "(stored once, both manifest entries kept)"
+                        "(stored once per archive, all manifest entries kept)"
                     )
                 else:
                     duplicates_map[hex_digest] = element["path"]
@@ -521,8 +526,7 @@ class PackContext:
     def is_shared_resource(self, resource_path):
         # Resources used by more than one collection are packed into common_*
         # archives (see create_common_archives_by_dependency_sets). Packing them
-        # per-collection as well only produces empty stub archives, because
-        # add_files_to_zip writes each resource's bytes exactly once and the
+        # per-collection as well would duplicate payloads unnecessarily: each
         # collection already depends on the common archive that holds them.
         return self.common_files.get(resource_path, {}).get("use_count", 0) > 1
 

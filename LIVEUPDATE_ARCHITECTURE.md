@@ -85,6 +85,13 @@ Logic:
 3. `create_common_archives_by_dependency_sets` groups shared resources by the **exact set of consumer collections** — so a common chunk is re-downloaded only by the collections that actually use it.
 4. `split_by_size` slices each class into chunks that target ≤ `MAX_ARCHIVE_SIZE` (7 MiB). It keeps `*.texturec` + `*.a.texturesetc` pairs together (by shared stem) and keeps each `*.soundc` together with its compiled audio (`*.oggc`/`*.opusc`/`*.wavc`) in the same chunk. Sound co-location follows the graph `children` edge, not a shared name, and is 1:N — a component with several format variants stays whole. A single indivisible unit (a texture pair or a sound + its audio) whose size alone exceeds the cap is emitted whole in its own archive rather than split, so an archive can legitimately exceed 7 MiB.
 
+Content hashes are deduplicated **within each archive**. Different resource paths
+can have identical bytes but belong to different archives and consumer sets. Each
+such archive must include the payload: path-based dependency grouping does not
+make a collection download another archive merely because it holds the same
+hash. This also applies when replaying a highres layout with `--restore_from_tree`
+for lowres, where previously different resources may compile to identical bytes.
+
 ### 2.3 Archive version
 
 `compute_version_hash_from_files` (and the equivalent in `create_zip_archive`) computes `version_hash` as a SHA-256 over:

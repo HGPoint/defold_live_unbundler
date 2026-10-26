@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- Limit content-hash deduplication to each archive. Resources with different paths
+  but identical bytes must remain available in every archive their consumers
+  download; global deduplication could leave collections missing particle effects
+  or scripts until an unrelated module was loaded. Applies to fresh packing and
+  `--restore_from_tree` highres/lowres builds.
+- Add offline regression tests for independently loading aliases, preserving
+  manifest URL entries, lowres hash merging and aliases split across common chunks.
+
 ## [2.0] - 2026-07-18
 
 Sync with the production client this reference project mirrors: the runtime module
