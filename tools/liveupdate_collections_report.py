@@ -2,7 +2,7 @@
 """Generate a self-contained HTML report about liveupdate collections.
 
 Reads the highres and lowres ``manifest.json`` produced by ``liveupdate_pack.py``
-(``file_versions`` / ``file_sizes`` / ``deps``) and the highres ``files_tree.json``
+(``file_versions`` / ``file_sizes`` / ``deps``) and each resolution's ``files_tree.json``
 (per-archive file listing), then builds an interactive report:
 
   * overview: versions, total download size per resolution, archive kinds
@@ -235,17 +235,20 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
     if lowres_dir and (lowres_dir / "manifest.json").exists():
         low_manifest = load_json(lowres_dir / "manifest.json")
 
-    files_tree = None
-    files_tree_path = highres_dir / "files_tree.json"
-    if files_tree_path.exists():
-        files_tree = load_json(files_tree_path)
+    def read_tree(directory):
+        path = directory / "files_tree.json" if directory else None
+        return load_json(path).get("zip_files", {}) if path and path.exists() else {}
 
-    file_versions = high_manifest.get("file_versions") or {}
-    deps = high_manifest.get("deps") or {}
-    dep_keys = set(deps)  # authoritative set of dependency archives (texture/sound/common)
+    high_zip_files = read_tree(highres_dir)
+    low_zip_files = read_tree(lowres_dir)
+    high_versions = high_manifest.get("file_versions") or {}
+    low_versions = (low_manifest or {}).get("file_versions") or {}
+    high_deps = high_manifest.get("deps") or {}
+    low_deps = (low_manifest or {}).get("deps") or {}
+    dep_keys = set(high_deps) | set(low_deps)
+    archive_names = sorted(set(high_versions) | set(low_versions))
     high_sizes = normalize_file_sizes(high_manifest)
     low_sizes = normalize_file_sizes(low_manifest) if low_manifest else {}
-    zip_files = (files_tree or {}).get("zip_files", {})
 
     warnings = []
     if not high_sizes:
@@ -257,12 +260,12 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
         warnings.append("Lowres manifest not found — lowres sizes are unavailable.")
     elif not low_sizes:
         warnings.append("Lowres manifest has no file_sizes — lowres download sizes are unavailable.")
-    if not zip_files:
+    if not high_zip_files:
         warnings.append("Highres files_tree.json not found — per-file archive contents are unavailable.")
 
     if low_manifest is not None:
-        only_high = set(file_versions) - set(low_manifest.get("file_versions") or {})
-        only_low = set(low_manifest.get("file_versions") or {}) - set(file_versions)
+        only_high = set(high_versions) - set(low_versions)
+        only_low = set(low_versions) - set(high_versions)
         if only_high or only_low:
             warnings.append(
                 "Highres and lowres manifests list different archives "
@@ -273,14 +276,12 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
     if modules_lua and presets is None:
         warnings.append(f"Module presets source not found: {modules_lua}")
 
-    proto_res = parse_archive_protos(highres_dir)
-    if proto_res is None:
+    high_proto = parse_archive_protos(highres_dir)
+    low_proto = parse_archive_protos(lowres_dir) if low_manifest else None
+    if high_proto is None:
         warnings.append("Per-resource proto data unavailable (no .arcd0 archives or protobuf) — compressed size / flags omitted.")
 
-    # archive -> record
-    archives = {}
-    for name in file_versions:
-        tree = zip_files.get(name, {})
+    def file_records(tree, proto_res):
         files = []
         for fr in tree.get("files", []):
             digest = fr.get("hexDigest", "")
@@ -292,45 +293,75 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
                 rec["uhash"] = proto["uhash"]
             files.append(rec)
         files.sort(key=lambda f: f["size"], reverse=True)
-        consumers = sorted(deps.get(name, []))
+        return files
+
+    # Keep the legacy combined fields, and retain each side's dependencies and
+    # tree separately: restoring lowres may create common groups absent in highres.
+    archives = {}
+    for name in archive_names:
+        high_tree = high_zip_files.get(name, {})
+        low_tree = low_zip_files.get(name, {})
+        high_files = file_records(high_tree, high_proto)
+        low_files = file_records(low_tree, low_proto)
+        high_consumers = sorted(high_deps.get(name, []))
+        low_consumers = sorted(low_deps.get(name, []))
+        consumers = sorted(set(high_consumers) | set(low_consumers))
         archives[name] = {
             "name": name,
             "kind": classify(name, dep_keys),
             "high": high_sizes.get(name, 0),
             "low": low_sizes.get(name, 0),
-            "uncompressed": tree.get("size", 0),
+            "uncompressed": (high_tree or low_tree).get("size", 0),
+            "high_uncompressed": high_tree.get("size", 0),
+            "low_uncompressed": low_tree.get("size", 0),
             "consumers": consumers,
+            "high_consumers": high_consumers,
+            "low_consumers": low_consumers,
             "fanout": len(consumers),
-            "files": files,
+            "files": high_files or low_files,
+            "high_files": high_files,
+            "low_files": low_files,
         }
 
     # collection -> archive set (base + its texture archives + shared commons)
-    coll_names = [n for n in file_versions if classify(n) == "coll_base"]
-    coll_to_archives = {c: set() for c in coll_names}
-    for archive, cols in deps.items():
-        for col in cols:
-            coll_to_archives.setdefault(col, set()).add(archive)
-    for col in coll_names:
-        coll_to_archives[col].add(col)  # the collection's own base archive
+    coll_names = [n for n in archive_names if classify(n, dep_keys) == "coll_base"]
+
+    def collection_archives(versions, deps):
+        result = {c: {c} for c in coll_names if c in versions}
+        for archive, cols in deps.items():
+            for col in cols:
+                result.setdefault(col, set()).add(archive)
+        return result
+
+    high_coll_archives = collection_archives(high_versions, high_deps)
+    low_coll_archives = collection_archives(low_versions, low_deps)
 
     collections = {}
     for col in coll_names:
-        arcs = sorted(coll_to_archives[col])
+        high_arcs = sorted(high_coll_archives.get(col, set()))
+        low_arcs = sorted(low_coll_archives.get(col, set()))
+        arcs = sorted(set(high_arcs) | set(low_arcs))
         # exclusive: only this collection pulls it (base always; deps fanout <= 1)
         exclusive = [a for a in arcs if a == col or archives[a]["fanout"] <= 1]
         shared = [a for a in arcs if a != col and archives[a]["fanout"] > 1]
+        high_exclusive = [a for a in high_arcs if a == col or len(high_deps.get(a, [])) <= 1]
+        low_exclusive = [a for a in low_arcs if a == col or len(low_deps.get(a, [])) <= 1]
+        high_shared = [a for a in high_arcs if a not in high_exclusive]
+        low_shared = [a for a in low_arcs if a not in low_exclusive]
         collections[col] = {
             "name": col,
             "archives": arcs,
+            "high_archives": high_arcs,
+            "low_archives": low_arcs,
             "exclusive": exclusive,
             "shared": shared,
-            "high": sum(archives[a]["high"] for a in arcs),
-            "low": sum(archives[a]["low"] for a in arcs),
-            "high_exclusive": sum(archives[a]["high"] for a in exclusive),
-            "high_shared": sum(archives[a]["high"] for a in shared),
-            "low_exclusive": sum(archives[a]["low"] for a in exclusive),
-            "low_shared": sum(archives[a]["low"] for a in shared),
-            "uncompressed": sum(archives[a]["uncompressed"] for a in arcs),
+            "high": sum(archives[a]["high"] for a in high_arcs),
+            "low": sum(archives[a]["low"] for a in low_arcs),
+            "high_exclusive": sum(archives[a]["high"] for a in high_exclusive),
+            "high_shared": sum(archives[a]["high"] for a in high_shared),
+            "low_exclusive": sum(archives[a]["low"] for a in low_exclusive),
+            "low_shared": sum(archives[a]["low"] for a in low_shared),
+            "uncompressed": sum(archives[a]["high_uncompressed"] for a in high_arcs),
         }
 
     # per-kind totals
@@ -342,7 +373,7 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
         bucket["low"] += rec["low"]
 
     distinct_resources = set()
-    for tree in zip_files.values():
+    for tree in high_zip_files.values():
         for fr in tree.get("files", []):
             if fr.get("hexDigest"):
                 distinct_resources.add(fr["hexDigest"])
@@ -350,7 +381,7 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
     # ---- duplicate analysis --------------------------------------------------
     hi_size = {}
     for rec in archives.values():
-        for f in rec["files"]:
+        for f in rec["high_files"]:
             hi_size[f["hex"]] = f["size"]
 
     # same content under >1 path — read from the full (uncollapsed) game dmanifest
@@ -374,12 +405,15 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
         "low_version": low_manifest.get("version") if low_manifest else None,
         "high_total": sum(high_sizes.values()),
         "low_total": sum(low_sizes.values()),
-        "high_uncompressed_total": sum(a["uncompressed"] for a in archives.values()),
-        "archive_count": len(file_versions),
+        "high_uncompressed_total": sum(a["high_uncompressed"] for a in archives.values()),
+        "low_uncompressed_total": sum(a["low_uncompressed"] for a in archives.values()),
+        "archive_count": len(archive_names),
+        "high_archive_count": len(high_versions),
+        "low_archive_count": len(low_versions),
         "collection_count": len(coll_names),
         "kinds": kinds,
         "distinct_resources": len(distinct_resources),
-        "has_files_tree": bool(zip_files),
+        "has_files_tree": bool(high_zip_files or low_zip_files),
         "has_low": low_manifest is not None,
     }
 
@@ -616,7 +650,8 @@ function hl(text, q) {
 // ResourceEntryFlag bits from the dmanifest proto
 const FLAG_BITS = [[8, "COMPRESSED"], [4, "ENCRYPTED"], [2, "EXCLUDED"], [1, "BUNDLED"]];
 function flagNames(f) { return FLAG_BITS.filter(([b]) => f & b).map(([, n]) => n); }
-const HAS_PROTO = archList.some(a => a.files.some(f => f.csize != null));
+function archiveFiles(rec) { return [...(rec.high_files || rec.files), ...(rec.low_files || [])]; }
+const HAS_PROTO = archList.some(a => archiveFiles(a).some(f => f.csize != null));
 
 // Full file listing table for an archive. When per-resource proto data is
 // available it adds compressed size + flags (compressed size exists only in the
@@ -636,6 +671,15 @@ function fileTableHtml(rec, q) {
   return '<table class="files"><thead>' + head + '</thead><tbody>' + rows + '</tbody></table>';
 }
 
+function archiveFilesHtml(rec, q) {
+  const hi = rec.high_files || [], lo = rec.low_files || [];
+  if (hi.length && lo.length && JSON.stringify(hi) !== JSON.stringify(lo)) {
+    return '<div class="muted">Highres files</div>' + fileTableHtml({...rec, files: hi}, q) +
+      '<div class="muted">Lowres files</div>' + fileTableHtml({...rec, files: lo}, q);
+  }
+  return (!hi.length && lo.length ? '<div class="muted">Lowres files</div>' : '') + fileTableHtml(rec, q);
+}
+
 // Expandable file listing for an archive record. Pass summaryHtml to override
 // the (already-escaped) summary text; otherwise a "N files · content" summary is used.
 function fileDetails(rec, summaryHtml) {
@@ -647,7 +691,7 @@ function fileDetails(rec, summaryHtml) {
       ? summaryHtml + ' <span class="muted">(no file listing)</span>'
       : '<span class="muted">no file listing</span>';
   }
-  return '<details><summary>' + summary + '</summary>' + fileTableHtml(rec) + '</details>';
+  return '<details><summary>' + summary + '</summary>' + archiveFilesHtml(rec) + '</details>';
 }
 
 // ---- subtitle + warnings + overview ---------------------------------------
@@ -765,13 +809,13 @@ const archTable = makeTable("arch-table", allArchives, null, {
   sortKey: "high",
   prefilter: row => activeKinds.has(row.kind),
   match: (row, f) => row.name.toLowerCase().includes(f) ||
-    row.files.some(fl => fl.path.toLowerCase().includes(f) ||
+    archiveFiles(row).some(fl => fl.path.toLowerCase().includes(f) ||
       (fl.hex && fl.hex.toLowerCase().includes(f)) || (fl.uhash && fl.uhash.includes(f))),
   render: (r, q) => {
     const has = r.files.length > 0;
     const ql = (q || "").toLowerCase();
     // auto-expand when the match is inside the files (e.g. a hash) rather than the archive name
-    const fileMatch = ql && r.files.some(fl => fl.path.toLowerCase().includes(ql) ||
+    const fileMatch = ql && archiveFiles(r).some(fl => fl.path.toLowerCase().includes(ql) ||
       (fl.hex && fl.hex.toLowerCase().includes(ql)) || (fl.uhash && fl.uhash.includes(ql)));
     const open = fileMatch && !r.name.toLowerCase().includes(ql);
     const cells = '<td>' + hl(r.name, q) + '</td>' +
@@ -783,7 +827,7 @@ const archTable = makeTable("arch-table", allArchives, null, {
       '<td class="num">' + mb(r.uncompressed) + '</td>' +
       '<td class="files-cell">' + (has ? '<span class="caret">▸</span> ' + r.files.length + " files" : '<span class="muted">—</span>') + '</td>';
     // the file listing lives in its own full-width row below, toggled by the click handler
-    const detail = has ? '<tr class="arch-detail"' + (open ? "" : " hidden") + '><td colspan="7">' + fileTableHtml(r, q) + '</td></tr>' : "";
+    const detail = has ? '<tr class="arch-detail"' + (open ? "" : " hidden") + '><td colspan="7">' + archiveFilesHtml(r, q) + '</td></tr>' : "";
     return '<tr class="arch-row' + (has ? " expandable" : "") + (open ? " open" : "") + '">' + cells + '</tr>' + detail;
   },
   afterRender: shown => {
@@ -836,13 +880,17 @@ function renderChecks(filter) {
 function recompute() {
   el("sel-count").textContent = selected.size + " selected";
   const union = new Set();
+  const highUnion = new Set(), lowUnion = new Set();
   for (const name of selected) {
     const c = C[name];
     if (!c) continue;
     c.archives.forEach(a => union.add(a));
+    (c.high_archives || c.archives).forEach(a => highUnion.add(a));
+    (c.low_archives || c.archives).forEach(a => lowUnion.add(a));
   }
   let uHigh = 0, uLow = 0;
-  union.forEach(a => { uHigh += A[a].high; uLow += A[a].low; });
+  highUnion.forEach(a => { uHigh += A[a].high; });
+  lowUnion.forEach(a => { uLow += A[a].low; });
 
   el("sel-result").innerHTML = selected.size ? [
     ["Download", human(uHigh) + " / " + human(uLow), "hi / lo"],
@@ -852,17 +900,26 @@ function recompute() {
     '</div><div class="l">' + l + (note ? ' <span class="muted">' + note + '</span>' : "") + '</div></div>'
   ).join("") : '<div class="muted">Select collections to see the deduplicated download size.</div>';
 
-  // split the union: archives shared by >1 selected collection vs pulled by just one
+  // Sharing is calculated separately per resolution; archive sets may differ.
   if (selected.size >= 1) {
     const usedBy = {};
     for (const name of selected) {
-      for (const a of C[name].archives) (usedBy[a] = usedBy[a] || []).push(name);
+      for (const side of ["high", "low"]) {
+        for (const a of (C[name][side + "_archives"] || C[name].archives)) {
+          const rec = usedBy[a] = usedBy[a] || {high: [], low: []};
+          rec[side].push(name);
+        }
+      }
     }
-    const entries = Object.entries(usedBy);
+    const entries = Object.entries(usedBy).map(([a, sides]) => ({
+      a, cols: [...new Set([...sides.high, ...sides.low])],
+      shared: sides.high.length > 1 || sides.low.length > 1,
+      high: sides.high.length ? A[a].high : 0,
+      low: sides.low.length ? A[a].low : 0,
+    }));
     const hint = '<span class="muted" style="font-weight:400">— click an archive to see its files</span>';
 
-    const shared = entries.filter(([, cols]) => cols.length > 1)
-      .map(([a, cols]) => ({ a, cols, high: A[a].high, low: A[a].low }))
+    const shared = entries.filter(e => e.shared)
       .sort((x, y) => y.high - x.high);
     el("sel-shared").innerHTML = shared.length
       ? '<h3 style="font-size:14px;margin:14px 0 6px">Shared archives (' + shared.length + ') ' + hint + '</h3>' +
@@ -873,17 +930,16 @@ function recompute() {
         '</tbody></table>'
       : (selected.size >= 2 ? '<div class="muted" style="margin-top:10px">No archives are shared between the selected collections.</div>' : "");
 
-    const own = entries.filter(([, cols]) => cols.length === 1)
-      .map(([a, cols]) => ({ a, col: cols[0], high: A[a].high, low: A[a].low }))
+    const own = entries.filter(e => !e.shared)
       .sort((x, y) => y.high - x.high);
     el("sel-own").innerHTML = own.length
       ? '<h3 style="font-size:14px;margin:14px 0 6px">Own archives (' + own.length + ') ' +
-        '<span class="muted" style="font-weight:400">— pulled by a single selected collection, click to see files</span></h3>' +
-        '<table><thead><tr><th>Archive</th><th>Kind</th><th class="num">Highres</th><th class="num">Lowres</th><th>Collection</th></tr></thead><tbody>' +
+        '<span class="muted" style="font-weight:400">— pulled by at most one selected collection per resolution, click to see files</span></h3>' +
+        '<table><thead><tr><th>Archive</th><th>Kind</th><th class="num">Highres</th><th class="num">Lowres</th><th>Collections</th></tr></thead><tbody>' +
         own.map(s => '<tr><td>' + fileDetails(A[s.a], esc(s.a)) +
           '</td><td><span class="kind ' + A[s.a].kind + '">' + A[s.a].kind + '</span></td><td class="num">' + mb(s.high) +
           '</td><td class="num">' + mb(s.low) + '</td><td class="muted">' +
-          esc(s.col.replace(/\.collectionc$/, "")) + '</td></tr>').join("") +
+          esc(s.cols.map(c => c.replace(/\.collectionc$/, "")).join(", ")) + '</td></tr>').join("") +
         '</tbody></table>'
       : "";
   } else {

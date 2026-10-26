@@ -6,13 +6,19 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Fixed
-- Limit content-hash deduplication to each archive. Resources with different paths
-  but identical bytes must remain available in every archive their consumers
-  download; global deduplication could leave collections missing particle effects
-  or scripts until an unrelated module was loaded. Applies to fresh packing and
-  `--restore_from_tree` highres/lowres builds.
-- Add offline regression tests for independently loading aliases, preserving
-  manifest URL entries, lowres hash merging and aliases split across common chunks.
+- Move identical content hashes from different archives into shared `common_*`
+  archives and add dependencies for every consumer. Keep all `url_hash` aliases;
+  plaintext resource URLs are not required. This prevents collections from
+  missing particle effects or scripts until an unrelated module is loaded.
+- Reconcile hash sharing during `--restore_from_tree`, including resources that
+  become identical only in lowres. Save each resolution's actual files tree and
+  keep empty base archives available for module checks and future restores.
+- Keep digest aliases and colocated texture/set and sound/audio groups together
+  during promotion and chunking; count content size once per unique hash.
+- Report each resolution's archive/dependency sets separately, including common
+  archives present only in lowres.
+- Add offline regressions for stripped manifest URLs, common dependency coverage,
+  resolution hash changes, empty bases, media grouping and report totals.
 
 ## [2.0] - 2026-07-18
 

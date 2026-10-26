@@ -82,21 +82,28 @@ Logic:
 
 1. `get_deps_files` walks every `ExcludedCollectionProxy` and gathers their transitive dependencies.
 2. `build_common_files` tags resources with `use_count` (how many collections reference each one).
-3. `create_common_archives_by_dependency_sets` groups shared resources by the **exact set of consumer collections** — so a common chunk is re-downloaded only by the collections that actually use it.
-4. `split_by_size` slices each class into chunks that target ≤ `MAX_ARCHIVE_SIZE` (7 MiB). It keeps `*.texturec` + `*.a.texturesetc` pairs together (by shared stem) and keeps each `*.soundc` together with its compiled audio (`*.oggc`/`*.opusc`/`*.wavc`) in the same chunk. Sound co-location follows the graph `children` edge, not a shared name, and is 1:N — a component with several format variants stays whole. A single indivisible unit (a texture pair or a sound + its audio) whose size alone exceeds the cap is emitted whole in its own archive rather than split, so an archive can legitimately exceed 7 MiB.
+3. `create_common_archives_by_dependency_sets` and `create_collection_archives` plan archives by the **exact set of consumer collections**.
+4. `share_duplicate_content` finds content hashes present in multiple planned archives and moves their paths into `common_*` groups. Every collection consuming any source archive receives the new dependency. Texture/set pairs and sound/audio groups already colocated with a duplicate move together.
+5. `split_by_size` slices each class into chunks that target ≤ `MAX_ARCHIVE_SIZE` (7 MiB). It keeps `*.texturec` + `*.a.texturesetc` pairs together (by shared stem) and keeps each `*.soundc` together with its compiled audio (`*.oggc`/`*.opusc`/`*.wavc`) in the same chunk. Sound co-location follows the graph `children` edge, not a shared name, and is 1:N — a component with several format variants stays whole. A single indivisible unit (a texture pair or a sound + its audio) whose size alone exceeds the cap is emitted whole in its own archive rather than split, so an archive can legitimately exceed 7 MiB.
 
-Content hashes are deduplicated **within each archive**. Different resource paths
-can have identical bytes but belong to different archives and consumer sets. Each
-such archive must include the payload: path-based dependency grouping does not
-make a collection download another archive merely because it holds the same
-hash. This also applies when replaying a highres layout with `--restore_from_tree`
-for lowres, where previously different resources may compile to identical bytes.
+Deduplication uses **`hexDigest`**, independent of plaintext URL strings in the
+compiled manifest. A shared payload is stored in one common archive, with all of
+its `url_hash` resource entries retained. Every alias path remains in `files_tree`
+so it can resolve to different content in another resolution. Alias groups are
+indivisible during chunking and count toward the size limit once per digest.
+
+`--restore_from_tree` starts with the saved layout and repeats content sharing
+using the current resolution's hashes. If distinct highres resources merge in
+lowres, lowres gains a common archive and its own dependency entries. Each side
+writes its own `files_tree.json`; the report accounts for each side's archive and
+dependency sets separately. Empty base archives remain in the layout so module
+availability checks and subsequent restores still find every collection.
 
 ### 2.3 Archive version
 
 `compute_version_hash_from_files` (and the equivalent in `create_zip_archive`) computes `version_hash` as a SHA-256 over:
 
-- `dmanifest` `resource` entries sorted by `hash.data.hex()`,
+- `dmanifest` `resource` entries for unique content hashes, sorted by `hash.data.hex()`,
 - the string `content_hash_no_manifest:<sha256 of contents excluding dmanifest>`.
 
 The first `HASH_LEN = 16` hex characters are kept. The same string is used in:

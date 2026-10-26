@@ -48,6 +48,7 @@ class PackContext:
 
         self.added_files = {}
         self.created_archives = {}
+        self.archive_files = {}
         self.files_tree = {"zip_files": {}}
 
         self.dmanifest = None
@@ -133,19 +134,12 @@ class PackContext:
                 self.resources_folder,
                 self.files[filepath]["hexDigest"],
             )
-            if not self.restore_from_tree:
-                if common_zip_name not in self.files_tree["zip_files"]:
-                    self.files_tree["zip_files"][common_zip_name] = {
-                        "files": [],
-                        "size": 0,
-                    }
-                self.files_tree["zip_files"][common_zip_name]["files"].append(
-                    self.files[filepath]
-                )
-                self.files_tree["zip_files"][common_zip_name]["size"] += self.files[
-                    filepath
-                ]["size"]
-            if self.files[filepath]["hexDigest"] not in self.added_files:
+            archive_info = self.files_tree["zip_files"].setdefault(
+                common_zip_name, {"files": [], "size": 0}
+            )
+            archive_info["files"].append(file_info)
+            if hex_digest not in self.added_files:
+                archive_info["size"] += size
                 with open(file_path_hex, "rb") as file_obj:
                     file_contents = file_obj.read()
                     content_hashers["all"].update(file_contents)
@@ -175,15 +169,14 @@ class PackContext:
                         self.dependency_list[main_file].append(common_files_list_name)
 
     def create_zip_archive(self, zip_name, files_list, common_files_list_name=None):
-        # Dependencies are grouped by resource path, but distinct paths can have
-        # identical bytes. Deduplicate only inside this archive: skipping a hash
-        # written to another archive would leave consumers without its payload.
-        # This also keeps restored highres/lowres layouts independently loadable.
+        # Layout planning shares hashes across archives; keep a local guard for
+        # aliases inside an archive and callers replaying a layout directly.
         self.added_files = {}
         common_zip_name = zip_name
         zip_name = zip_name + self.temp_suffix
         zip_path = os.path.join(self.result_folder, zip_name + self.extension_archive)
         self.dmanifest_data.ClearField("resources")
+        self.files_tree["zip_files"].setdefault(common_zip_name, {"files": [], "size": 0})
         content_hashers = {
             "all": hashlib.sha256(),
             "no_manifest": hashlib.sha256(),
@@ -331,119 +324,180 @@ class PackContext:
                 all_file_paths.add(key)
         self.precheck_all_files_for_list(list(all_file_paths))
 
+    def plan_zip_archive(self, name, files_list, common_files_list_name=None):
+        # Different alias chunks can have the same content-derived name. Keep
+        # every logical path so restore can resolve it at the other resolution.
+        paths = self.archive_files.setdefault(name, [])
+        known_paths = set(paths)
+        for path in files_list:
+            if path not in known_paths:
+                paths.append(path)
+                known_paths.add(path)
+            if common_files_list_name:
+                for collection in self.common_files.get(path, {}).get("files", []):
+                    dependencies = self.dependency_list.setdefault(collection, [])
+                    if name not in dependencies:
+                        dependencies.append(name)
+
+    def share_duplicate_content(self):
+        archive_consumers = {}
+        base_archives = set()
+        for proxy in self.zip_files:
+            collection = self.files[proxy]["children"][0]
+            name = self.collection_name(collection)
+            base_archives.add(name)
+            archive_consumers.setdefault(name, set()).add(collection)
+        for collection, dependencies in self.dependency_list.items():
+            for archive in dependencies:
+                archive_consumers.setdefault(archive, set()).add(collection)
+
+        by_digest = {}
+        for archive, paths in self.archive_files.items():
+            for path in paths:
+                digest = self.files[path]["hexDigest"]
+                info = by_digest.setdefault(digest, {"archives": set()})
+                info["archives"].add(archive)
+
+        duplicate_digests = {digest for digest, info in by_digest.items()
+                             if len(info["archives"]) > 1}
+        shared_digests = set()
+        groups = {}
+        all_paths = list(dict.fromkeys(
+            path for paths in self.archive_files.values() for path in paths
+        ))
+        for paths in self.resource_units(all_paths, self.archive_files.values()):
+            digests = {self.files[path]["hexDigest"] for path in paths}
+            if not digests.intersection(duplicate_digests):
+                continue
+            consumers = set()
+            for digest in digests:
+                for archive in by_digest[digest]["archives"]:
+                    consumers.update(archive_consumers.get(archive, ()))
+            if not consumers:
+                raise ValueError(f"No consumers for shared resource hashes {sorted(digests)}")
+            kinds = {
+                "texture" if self.is_texture_resource(path) else
+                "sound" if self.is_sound_resource(path) else "other"
+                for path in paths
+            }
+            # Identical bytes across resource kinds still need a single owner.
+            kind = next(iter(kinds)) if len(kinds) == 1 else "other"
+            key = (tuple(sorted(consumers)), kind)
+            groups.setdefault(key, set()).update(paths)
+            shared_digests.update(digests)
+
+        for archive, paths in list(self.archive_files.items()):
+            paths = [path for path in paths
+                     if self.files[path]["hexDigest"] not in shared_digests]
+            if paths or archive in base_archives:
+                self.archive_files[archive] = paths
+            else:
+                del self.archive_files[archive]
+                for dependencies in self.dependency_list.values():
+                    if archive in dependencies:
+                        dependencies.remove(archive)
+
+        for (consumers, kind), paths in sorted(groups.items()):
+            prefix = {"other": "common", "texture": "common_texture",
+                      "sound": "common_sound"}[kind]
+            for chunk in self.split_by_size(sorted(paths)):
+                name = f"{prefix}_{self.compute_version_hash_from_files(chunk)}"
+                self.plan_zip_archive(name, chunk)
+                for collection in consumers:
+                    dependencies = self.dependency_list.setdefault(collection, [])
+                    if name not in dependencies:
+                        dependencies.append(name)
+
+    def write_planned_archives(self):
+        self.share_duplicate_content()
+        for name, paths in self.archive_files.items():
+            self.create_zip_archive(name, paths)
+
     def restore_from_files_tree(self):
         print("Restoring from original files tree")
         original_files_tree = self.load_json_file("files_tree.json")
         manifest_output = original_files_tree["manifest"]
-        for zip_file_name in original_files_tree["zip_files"]:
-            restored_zip_files = []
-            for file in original_files_tree["zip_files"][zip_file_name]["files"]:
-                restored_zip_files.append(file["path"])
+        collections = {
+            self.collection_name(self.files[proxy]["children"][0]):
+            self.files[proxy]["children"][0]
+            for proxy in self.zip_files
+        }
+        self.dependency_list = {}
+        for archive, names in manifest_output["deps"].items():
+            for name in names:
+                self.dependency_list.setdefault(collections[name], []).append(archive)
+        for name, info in original_files_tree["zip_files"].items():
+            self.plan_zip_archive(name, [file["path"] for file in info["files"]])
 
-            self.create_zip_archive(zip_file_name, restored_zip_files, zip_file_name)
-
+        # A different resolution may merge previously distinct content hashes.
+        # Reconcile owners/dependencies before replaying the saved layout.
+        self.write_planned_archives()
         self.rename_archives_to_version()
-
-        manifest_output["version"] = self.current_timestamp
-        manifest_output["file_versions"] = self.build_file_versions()
-        manifest_output["file_sizes"] = self.build_file_sizes()
-        manifest_output["dmanifest_info"] = self.build_dmanifest_info()
+        restored_manifest = self.build_manifest_output()
+        for key in ("version", "deps", "file_versions", "file_sizes", "dmanifest_info"):
+            manifest_output[key] = restored_manifest[key]
         if self.client_version is not None:
             manifest_output["client_version"] = self.client_version
-        with open(os.path.join(self.result_folder, "manifest.json"), "w") as outfile:
-            json.dump(manifest_output, outfile, indent=4)
+        self.write_outputs(manifest_output)
         os.remove("files_tree.json")
+
+    def resource_units(self, file_keys, related_groups=None):
+        # Aliases, texture pairs and sound/audio edges form indivisible units.
+        # Components also handle transitive links (e.g. audio with two parents).
+        parents = {key: key for key in file_keys}
+
+        def find(key):
+            while parents[key] != key:
+                parents[key] = parents[parents[key]]
+                key = parents[key]
+            return key
+
+        def join(first, second):
+            parents[find(second)] = find(first)
+
+        digest_paths = {}
+        for key in file_keys:
+            digest = self.files[key]["hexDigest"]
+            if digest in digest_paths:
+                join(key, digest_paths[digest])
+            else:
+                digest_paths[digest] = key
+
+        # During promotion preserve pairs already colocated in a planned archive;
+        # do not join media deliberately routed to separate dependency groups.
+        for group in (related_groups if related_groups is not None else [file_keys]):
+            keys = set(group)
+            for key in group:
+                if key.endswith(".texturec"):
+                    pair = key[:-len(".texturec")] + ".a.texturesetc"
+                    if pair in keys:
+                        join(key, pair)
+                if key.endswith(".soundc"):
+                    for child in self.files[key].get("children", []):
+                        if self.is_sound_child(child) and child in keys:
+                            join(key, child)
+
+        units = {}
+        for key in file_keys:
+            units.setdefault(find(key), []).append(key)
+        return list(units.values())
 
     def split_by_size(self, file_keys):
         if MAX_ARCHIVE_SIZE <= 0:
             return [list(file_keys)]
-        file_sized_lists = []
-        fs_list = []
-        size = 0
 
-        key_index = {key: index for index, key in enumerate(file_keys)}
-        key_set = set(file_keys)
-        used = set()
-
-        def make_unit(keys):
-            unit_size = 0
-            for k in keys:
-                unit_size += self.files[k]["size"]
-            return {"keys": keys, "size": unit_size}
-
-        # Sound grouping: keep a .soundc together with its compiled audio children
-        # (.oggc / .opusc / .wavc) so a component and the samples it plays land in
-        # one archive. The relationship is the graph "children" edge (they do not
-        # share a stem like textures) and is 1:N. Restrict to keys in this list so
-        # a child that was routed elsewhere (e.g. a shared audio in common_*) is
-        # simply not pulled here.
-        soundc_children = {}
-        child_to_soundc = {}
-        for key in file_keys:
-            if key.endswith(".soundc"):
-                kids = [
-                    c
-                    for c in (self.files.get(key, {}).get("children") or [])
-                    if self.is_sound_child(c) and c in key_set
-                ]
-                soundc_children[key] = kids
-                for c in kids:
-                    child_to_soundc.setdefault(c, key)
-
-        units = []
-        for key in file_keys:
-            if key in used:
-                continue
-            used.add(key)
-            if key.endswith(".texturec"):
-                base = key[: -len(".texturec")]
-                pair = base + ".a.texturesetc"
-                if pair in key_set and pair not in used:
-                    used.add(pair)
-                    pair_order = (
-                        [key, pair] if key_index[key] < key_index[pair] else [pair, key]
-                    )
-                    units.append(make_unit(pair_order))
-                    continue
-            elif key.endswith(".a.texturesetc"):
-                base = key[: -len(".a.texturesetc")]
-                pair = base + ".texturec"
-                if pair in key_set and pair not in used:
-                    used.add(pair)
-                    pair_order = (
-                        [key, pair] if key_index[key] < key_index[pair] else [pair, key]
-                    )
-                    units.append(make_unit(pair_order))
-                    continue
-            elif key.endswith(".soundc") or self.is_sound_child(key):
-                # anchor on the .soundc (the parent); an audio child hit first
-                # resolves to its soundc so the whole group is emitted once
-                anchor = key if key.endswith(".soundc") else child_to_soundc.get(key)
-                if anchor is not None:
-                    group = [key]
-                    for member in [anchor] + soundc_children.get(anchor, []):
-                        if member not in used:
-                            used.add(member)
-                            group.append(member)
-                    group_order = sorted(set(group), key=lambda k: key_index[k])
-                    units.append(make_unit(group_order))
-                    continue
-            units.append(make_unit([key]))
-
-        for unit in units:
-            if size + unit["size"] > MAX_ARCHIVE_SIZE and fs_list:
-                file_sized_lists.append(fs_list)
-                fs_list = []
-                size = 0
-            if unit["size"] > MAX_ARCHIVE_SIZE and not fs_list:
-                file_sized_lists.append(unit["keys"])
-                continue
-            size += unit["size"]
-            fs_list.extend(unit["keys"])
-
-        if fs_list:
-            file_sized_lists.append(fs_list)
-        return file_sized_lists
+        chunks, chunk, size = [], [], 0
+        for keys in self.resource_units(file_keys):
+            unique_files = {self.files[key]["hexDigest"]: self.files[key] for key in keys}
+            unit_size = sum(info["size"] for info in unique_files.values())
+            if chunk and size + unit_size > MAX_ARCHIVE_SIZE:
+                chunks.append(chunk)
+                chunk, size = [], 0
+            chunk.extend(keys)
+            size += unit_size
+        if chunk:
+            chunks.append(chunk)
+        return chunks
 
     def is_texture_resource(self, resource_path):
         return resource_path.endswith(".texturec") or resource_path.endswith(
@@ -473,6 +527,7 @@ class PackContext:
     def compute_version_hash_from_files(self, files_list):
         version_hasher = hashlib.sha256()
         resources = []
+        seen_digests = set()
         for filepath in files_list:
             file_info = self.files.get(filepath)
             if not file_info:
@@ -480,7 +535,9 @@ class PackContext:
             hex_digest = file_info.get("hexDigest")
             if not hex_digest:
                 raise Exception(f"Missing hexDigest for file: {filepath}")
-            resources.extend(self.manifest_data_resources[hex_digest])
+            if hex_digest not in seen_digests:
+                resources.extend(self.manifest_data_resources[hex_digest])
+                seen_digests.add(hex_digest)
         for resource_entry in sorted(resources, key=lambda item: item.hash.data.hex()):
             version_hasher.update(resource_entry.SerializeToString())
         return self.truncate_hash(version_hasher.hexdigest())
@@ -509,19 +566,19 @@ class PackContext:
                 for chunk in self.split_by_size(other_files):
                     version_hash = self.compute_version_hash_from_files(chunk)
                     archive_name = f"common_{version_hash}"
-                    self.create_zip_archive(archive_name, chunk, archive_name)
+                    self.plan_zip_archive(archive_name, chunk, archive_name)
 
             if texture_files:
                 for chunk in self.split_by_size(texture_files):
                     version_hash = self.compute_version_hash_from_files(chunk)
                     archive_name = f"common_texture_{version_hash}"
-                    self.create_zip_archive(archive_name, chunk, archive_name)
+                    self.plan_zip_archive(archive_name, chunk, archive_name)
 
             if sound_files:
                 for chunk in self.split_by_size(sound_files):
                     version_hash = self.compute_version_hash_from_files(chunk)
                     archive_name = f"common_sound_{version_hash}"
-                    self.create_zip_archive(archive_name, chunk, archive_name)
+                    self.plan_zip_archive(archive_name, chunk, archive_name)
 
     def is_shared_resource(self, resource_path):
         # Resources used by more than one collection are packed into common_*
@@ -546,10 +603,9 @@ class PackContext:
             # Always emit the base collection archive (<name> + COLLECTION_SUFFIX):
             # the liveupdater requires every collection module's base name to exist in the
             # manifest (is_module_loaded / check_modules_integrity). A collection's
-            # own main object is exclusive, so other_files is non-empty in practice,
-            # but keep this unconditional so the invariant can't be broken by a
-            # collection whose only exclusive resources are textures.
-            self.create_zip_archive(zip_file_name, other_files)
+            # own data may move to common archives when it is byte-identical to
+            # another collection. Keep its base archive even when it is empty.
+            self.plan_zip_archive(zip_file_name, other_files)
 
             if texture_files:
                 main_file = self.files[path]["children"][0]
@@ -563,7 +619,7 @@ class PackContext:
                     else:
                         version_hash = self.compute_version_hash_from_files(chunk)
                         texture_archive_name = f"{base_name}_{version_hash}"
-                    self.create_zip_archive(texture_archive_name, chunk)
+                    self.plan_zip_archive(texture_archive_name, chunk)
                     if texture_archive_name not in self.dependency_list[main_file]:
                         self.dependency_list[main_file].append(texture_archive_name)
 
@@ -579,7 +635,7 @@ class PackContext:
                     else:
                         version_hash = self.compute_version_hash_from_files(chunk)
                         sound_archive_name = f"{base_name}_{version_hash}"
-                    self.create_zip_archive(sound_archive_name, chunk)
+                    self.plan_zip_archive(sound_archive_name, chunk)
                     if sound_archive_name not in self.dependency_list[main_file]:
                         self.dependency_list[main_file].append(sound_archive_name)
         print("Zip file collection completed.")
@@ -713,6 +769,7 @@ class PackContext:
 
         self.create_common_archives_by_dependency_sets()
         self.create_collection_archives()
+        self.write_planned_archives()
 
         self.rename_archives_to_version()
 
