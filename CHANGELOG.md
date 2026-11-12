@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- `file_parts` in highres `manifest.json`: when a packed `.arcd0` is split into
+  `.arcd0`/`.arcd1`/… chunks, download every part, concatenate, then mount as one
+  archive. Missing/`1` keeps the previous single-file path. Lowres unchanged.
+
 ### Fixed
 - Move identical content hashes from different archives into shared `common_*`
   archives and add dependencies for every consumer. Keep all `url_hash` aliases;
