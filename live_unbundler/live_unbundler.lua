@@ -46,6 +46,7 @@ end
 ---@field deps table<string, string[]>
 ---@field file_versions table<string, liveupdater.file_version_info|string>
 ---@field file_sizes table<string, integer>?
+---@field file_parts table<string, integer>?
 
 ---@class liveupdater.manifest_group
 ---@field lowres liveupdater.manifest? present only when the lowres resolution is active
@@ -59,6 +60,7 @@ end
 ---@field dep_set table<string, boolean> set of all dependency archive names
 ---@field path string server path for this resolution
 ---@field prefix string progress prefix for this resolution
+---@field parts table<string, integer> archive name -> part count, 1 when the manifest lists none
 
 ---A resolution side is present only when its server path was passed to M.init.
 ---At least one of the two is always present.
@@ -79,6 +81,7 @@ end
 ---@field path string
 ---@field prefix string
 ---@field resolution liveupdater.resolution
+---@field parts integer?
 ---@field remount boolean?
 ---@field order integer?
 ---@field reason string?
@@ -208,6 +211,14 @@ local FILE_EXTENSION = ".arcd0"
 ---@return string
 local function build_archive_filename(file_name, version)
 	return file_name .. "_" .. version .. FILE_EXTENSION
+end
+
+---@param file_name string
+---@param version string
+---@param part integer
+---@return string
+local function build_archive_part_filename(file_name, version, part)
+	return file_name .. "_" .. version .. ".arcd" .. tostring(part)
 end
 
 local RES_HIGH_ONLY = 1
@@ -511,7 +522,19 @@ local function build_manifest_side(manifest, path, prefix)
 		dep_set = dep_set,
 		path = path,
 		prefix = prefix,
+		parts = manifest.file_parts or {},
 	}
+end
+
+---@param side liveupdater.manifest_side
+---@param file_name string
+---@return integer
+local function part_count(side, file_name)
+	local count = side.parts[file_name]
+	if type(count) ~= "number" or count < 1 then
+		return 1
+	end
+	return count
 end
 
 ---@param manifest_group liveupdater.manifest_group
@@ -772,6 +795,7 @@ local function enqueue_modules(modules)
 						path = side.path,
 						prefix = side.prefix,
 						resolution = resolution,
+						parts = part_count(side, dep_name),
 						remount = resolution == "high",
 					}, string.format("dependency_of=%s", file_name))
 				end
@@ -810,6 +834,7 @@ local function enqueue_modules(modules)
 							path = low.path,
 							prefix = low.prefix,
 							resolution = "low",
+							parts = part_count(low, file_name),
 						}, "needs_low")
 					end
 				end
@@ -826,6 +851,7 @@ local function enqueue_modules(modules)
 							path = high.path,
 							prefix = high.prefix,
 							resolution = "high",
+							parts = part_count(high, file_name),
 							remount = true,
 						}, "needs_high")
 					end
@@ -988,16 +1014,53 @@ local function try_start_load_resources()
 			end
 		end
 
-		request_data(
-			load_info.prefix,
-			load_info.path,
-			build_archive_filename(load_info.file_name, load_info.version),
-			load_info.file_name,
-			callback,
-			nil,
-			load_info.version,
-			progress_callback
-		)
+		local parts = load_info.parts or 1
+		if parts <= 1 then
+			request_data(
+				load_info.prefix,
+				load_info.path,
+				build_archive_filename(load_info.file_name, load_info.version),
+				load_info.file_name,
+				callback,
+				nil,
+				load_info.version,
+				progress_callback
+			)
+		else
+			local collected = {}
+			local received_before = 0
+			local function fetch_part(part)
+				request_data(
+					load_info.prefix,
+					load_info.path,
+					build_archive_part_filename(load_info.file_name, load_info.version, part),
+					load_info.file_name,
+					function(success, data)
+						if not success then
+							callback(false, data)
+							return
+						end
+						collected[#collected + 1] = data
+						received_before = received_before + #data
+						if part + 1 >= parts then
+							callback(true, table.concat(collected))
+						else
+							fetch_part(part + 1)
+						end
+					end,
+					nil,
+					load_info.version,
+					function(bytes_received, bytes_total)
+						local total = load_info.size
+						if total <= 0 then
+							total = received_before + (bytes_total or 0)
+						end
+						progress_callback(received_before + (bytes_received or 0), total)
+					end
+				)
+			end
+			fetch_part(0)
+		end
 	else
 		in_flight_key = nil
 		in_flight_bytes = 0
