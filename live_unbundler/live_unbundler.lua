@@ -81,7 +81,7 @@ end
 ---@field path string
 ---@field prefix string
 ---@field resolution liveupdater.resolution
----@field parts integer?
+---@field parts integer
 ---@field remount boolean?
 ---@field order integer?
 ---@field reason string?
@@ -530,11 +530,7 @@ end
 ---@param file_name string
 ---@return integer
 local function part_count(side, file_name)
-	local count = side.parts[file_name]
-	if type(count) ~= "number" or count < 1 then
-		return 1
-	end
-	return count
+	return side.parts[file_name] or 1
 end
 
 ---@param manifest_group liveupdater.manifest_group
@@ -1014,7 +1010,7 @@ local function try_start_load_resources()
 			end
 		end
 
-		local parts = load_info.parts or 1
+		local parts = load_info.parts
 		if parts <= 1 then
 			request_data(
 				load_info.prefix,
