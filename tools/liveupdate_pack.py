@@ -11,9 +11,6 @@ import liveupdate_ddf_pb2
 
 MAX_ARCHIVE_SIZE = 7340032
 HASH_LEN = 16
-# Hosting uploads reject single objects above this size. Indivisible resource
-# units (e.g. a paged atlas texture pair) can still produce a larger .arcd0;
-# split those byte-wise into .arcd0/.arcd1/... and record file_parts.
 HOSTING_FILE_LIMIT = 25 * 1024 * 1024
 
 # Fixed timestamp for every zip entry. Build tools (e.g. bob) may stamp extracted
@@ -443,7 +440,6 @@ class PackContext:
             manifest_output[key] = restored_manifest[key]
         if self.client_version is not None:
             manifest_output["client_version"] = self.client_version
-        # Drop highres file_parts inherited via files_tree; recompute for this pack.
         self.apply_file_parts(manifest_output, parts)
         self.write_outputs(manifest_output)
         os.remove("files_tree.json")

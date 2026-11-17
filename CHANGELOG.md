@@ -5,12 +5,6 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-### Added
-- Packer (`liveupdate_pack.py`) splits any `.arcd0` over the hosting limit (25 MiB)
-  into `.arcd0`/`.arcd1`/… and writes `file_parts` into `manifest.json` (highres and
-  lowres). Runtime downloads every part, concatenates, then mounts one archive.
-  Missing/`1` keeps the single-file path.
-
 ### Fixed
 - Move identical content hashes from different archives into shared `common_*`
   archives and add dependencies for every consumer. Keep all `url_hash` aliases;
