@@ -11,6 +11,10 @@ import liveupdate_ddf_pb2
 
 MAX_ARCHIVE_SIZE = 7340032
 HASH_LEN = 16
+# Hosting uploads reject single objects above this size. Indivisible resource
+# units (e.g. a paged atlas texture pair) can still produce a larger .arcd0;
+# split those byte-wise into .arcd0/.arcd1/... and record file_parts.
+HOSTING_FILE_LIMIT = 25 * 1024 * 1024
 
 # Fixed timestamp for every zip entry. Build tools (e.g. bob) may stamp extracted
 # resources with epoch 0 (1970), which the ZIP format cannot represent — it only
@@ -433,11 +437,14 @@ class PackContext:
         # Reconcile owners/dependencies before replaying the saved layout.
         self.write_planned_archives()
         self.rename_archives_to_version()
+        parts = self.split_oversized_archives()
         restored_manifest = self.build_manifest_output()
         for key in ("version", "deps", "file_versions", "file_sizes", "dmanifest_info"):
             manifest_output[key] = restored_manifest[key]
         if self.client_version is not None:
             manifest_output["client_version"] = self.client_version
+        # Drop highres file_parts inherited via files_tree; recompute for this pack.
+        self.apply_file_parts(manifest_output, parts)
         self.write_outputs(manifest_output)
         os.remove("files_tree.json")
 
@@ -695,6 +702,46 @@ class PackContext:
                 archive_info["path"] = final_path
             print(f"Final archive: {final_name}")
 
+    def split_archive_file(self, file_path, limit=HOSTING_FILE_LIMIT):
+        size = os.path.getsize(file_path)
+        if size <= limit:
+            return 1
+        stem = os.path.basename(file_path)[: -len(self.extension_archive)]
+        part_count = (size + limit - 1) // limit
+        folder = os.path.dirname(file_path)
+        temps = []
+        with open(file_path, "rb") as source:
+            for index in range(part_count):
+                chunk = source.read(limit)
+                temp_path = os.path.join(folder, f".{stem}.arcd{index}.part")
+                with open(temp_path, "wb") as output:
+                    output.write(chunk)
+                temps.append(temp_path)
+        os.remove(file_path)
+        for index, temp_path in enumerate(temps):
+            os.replace(temp_path, os.path.join(folder, f"{stem}.arcd{index}"))
+        print(f"Split {stem} into {part_count} parts")
+        return part_count
+
+    def split_oversized_archives(self):
+        parts = {}
+        for common_name, archive_info in self.created_archives.items():
+            count = self.split_archive_file(archive_info["path"])
+            if count > 1:
+                parts[common_name] = count
+                # first part keeps the .arcd0 path used at rename time
+                stem = os.path.basename(archive_info["path"])[: -len(self.extension_archive)]
+                archive_info["path"] = os.path.join(
+                    self.result_folder, f"{stem}.arcd0"
+                )
+        return parts
+
+    def apply_file_parts(self, manifest_output, parts):
+        if parts:
+            manifest_output["file_parts"] = parts
+        else:
+            manifest_output.pop("file_parts", None)
+
     def build_file_versions(self):
         file_versions = {}
         for common_name, archive_info in self.created_archives.items():
@@ -772,8 +819,10 @@ class PackContext:
         self.write_planned_archives()
 
         self.rename_archives_to_version()
+        parts = self.split_oversized_archives()
 
         manifest_output = self.build_manifest_output()
+        self.apply_file_parts(manifest_output, parts)
         self.write_outputs(manifest_output)
 
         print("Process completed successfully.")

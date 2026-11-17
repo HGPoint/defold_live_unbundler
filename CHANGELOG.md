@@ -6,10 +6,10 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Added
-- `file_parts` in highres `manifest.json`: when a packed `.arcd0` is too large
-  (e.g. a paged atlas texture), split it into `.arcd0`/`.arcd1`/…, download all
-  parts, concatenate, then mount as one archive. Missing/`1` keeps the single-file
-  path. Lowres unchanged.
+- Packer (`liveupdate_pack.py`) splits any `.arcd0` over the hosting limit (25 MiB)
+  into `.arcd0`/`.arcd1`/… and writes `file_parts` into `manifest.json` (highres and
+  lowres). Runtime downloads every part, concatenates, then mounts one archive.
+  Missing/`1` keeps the single-file path.
 
 ### Fixed
 - Move identical content hashes from different archives into shared `common_*`
