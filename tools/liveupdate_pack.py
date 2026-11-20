@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import hashlib
 import json
 import math
@@ -11,6 +12,17 @@ import liveupdate_ddf_pb2
 
 MAX_ARCHIVE_SIZE = 7340032
 HASH_LEN = 16
+
+# Hosting rejects files over 25 MiB.
+MIB = 1024 * 1024
+ZIP_STORE_ARCHIVE_LIMIT = 24 * MIB
+HOSTING_FILE_LIMIT = 25 * MIB
+
+MERGE_SMALL_BUDGET = HOSTING_FILE_LIMIT
+MD5_CHUNK_SIZE = 256 * 1024
+PACK_PREFIX = "pack_"
+MERGE_RULE_KEYS = ("enabled", "small_archive_kib", "pack_limit_kib", "textures")
+MERGE_KEYS = ("enabled", "modules_lua", "module_patterns", "small_archive_kib", "pack_limit_kib", "textures", "modules", "packs", "exclude")
 
 # Fixed timestamp for every zip entry. Build tools (e.g. bob) may stamp extracted
 # resources with epoch 0 (1970), which the ZIP format cannot represent — it only
@@ -26,12 +38,80 @@ ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 # Makefile sets ".collectionc", which reproduces os.path.basename byte-for-byte).
 COLLECTION_SUFFIX = os.environ.get("LIVEUPDATE_COLLECTION_SUFFIX", "")
 
+# Must match Bob's MurmurHash.hash64: release manifests keep url_hash but clear url.
+_MURMUR64_M = 0xC6A4A7935BD1E995
+_MURMUR64_R = 47
+_MURMUR64_MASK = (1 << 64) - 1
+
+
+def path_url_hash(path):
+    data = path.encode("utf-8") if isinstance(path, str) else path
+    h = 0
+    nblocks = len(data) // 8
+    for i in range(nblocks):
+        k = int.from_bytes(data[i * 8 : (i + 1) * 8], "little")
+        k = (k * _MURMUR64_M) & _MURMUR64_MASK
+        k ^= k >> _MURMUR64_R
+        k = (k * _MURMUR64_M) & _MURMUR64_MASK
+        h = (h * _MURMUR64_M) & _MURMUR64_MASK
+        h ^= k
+    rem = len(data) % 8
+    off = nblocks * 8
+    k = 0
+    if rem >= 7:
+        k ^= data[off + 6] << 48
+    if rem >= 6:
+        k ^= data[off + 5] << 40
+    if rem >= 5:
+        k ^= data[off + 4] << 32
+    if rem >= 4:
+        k ^= data[off + 3] << 24
+    if rem >= 3:
+        k ^= data[off + 2] << 16
+    if rem >= 2:
+        k ^= data[off + 1] << 8
+    if rem >= 1:
+        k ^= data[off]
+    if rem:
+        k = (k * _MURMUR64_M) & _MURMUR64_MASK
+        k ^= k >> _MURMUR64_R
+        k = (k * _MURMUR64_M) & _MURMUR64_MASK
+        h = (h * _MURMUR64_M) & _MURMUR64_MASK
+        h ^= k
+    k = len(data)
+    k = (k * _MURMUR64_M) & _MURMUR64_MASK
+    k ^= k >> _MURMUR64_R
+    k = (k * _MURMUR64_M) & _MURMUR64_MASK
+    h = (h * _MURMUR64_M) & _MURMUR64_MASK
+    h ^= k
+    h ^= h >> _MURMUR64_R
+    h = (h * _MURMUR64_M) & _MURMUR64_MASK
+    h ^= h >> _MURMUR64_R
+    return h
+
 
 class PackContext:
-    def __init__(self, restore_from_tree=False, client_version=None):
+    def __init__(
+        self,
+        restore_from_tree=False,
+        client_version=None,
+        zip_store=False,
+        merge_config=None,
+    ):
         self.restore_from_tree = restore_from_tree
         self.client_version = client_version
+        self.zip_store = zip_store
+        self.merge_config = merge_config
         print("restore_from_tree: ", self.restore_from_tree)
+        if self.zip_store:
+            print("zip_store: 24 MiB store, then deflate, reject over 25 MiB")
+        if self.merge_config:
+            print(
+                f"merge: archives under {self.merge_config['small_archive_kib']} KiB into {PACK_PREFIX}* "
+                f"per client module, up to {self.merge_config['pack_limit_kib']} KiB"
+            )
+        else:
+            print("merge: off, one archive per collection")
 
         self.debug_files = False
         self.graph_path = "build/default/game.graph.json"
@@ -50,6 +130,7 @@ class PackContext:
         self.created_archives = {}
         self.archive_files = {}
         self.files_tree = {"zip_files": {}}
+        self.merged_archives = {}
 
         self.dmanifest = None
         self.dmanifest_data = None
@@ -57,7 +138,9 @@ class PackContext:
         self.excluded_proxies = {}
         self.zip_files = {}
         self.common_files = {}
-        self.manifest_data_resources = {}
+        self.resources_by_url = {}
+        self.resources_by_url_hash = {}
+        self.resources_by_hash = {}
         self.dependency_list = {}
 
     def get_file_size(self, hex_digest):
@@ -104,6 +187,31 @@ class PackContext:
                 print("{:<6} {:<30} {:<}".format(i, "Missing hexDigest", path))
             raise Exception("Found files missing hexDigest, build aborted.")
 
+    def entry_compression(self, zip_file, data):
+        if not self.zip_store:
+            return zipfile.ZIP_DEFLATED
+        size = len(data.encode("utf-8") if isinstance(data, str) else data)
+        written = getattr(zip_file, "_liveupdate_written", 0)
+        if written + size <= ZIP_STORE_ARCHIVE_LIMIT:
+            return zipfile.ZIP_STORED
+        return zipfile.ZIP_DEFLATED
+
+    def record_written(self, zip_file):
+        if not self.zip_store:
+            return
+        written = getattr(zip_file, "_liveupdate_written", 0)
+        zip_file._liveupdate_written = written + zip_file.filelist[-1].compress_size
+
+    def reject_oversized_archive(self, zip_path):
+        if not self.zip_store:
+            return
+        size = os.path.getsize(zip_path)
+        if size > HOSTING_FILE_LIMIT:
+            sys.exit(
+                f"[liveupdate] {zip_path} is {size / 1048576:.2f} MiB, over the "
+                f"{HOSTING_FILE_LIMIT / 1048576:.0f} MiB hosting limit even with deflate; shrink its atlas"
+            )
+
     def add_files_to_zip(
         self,
         common_zip_name,
@@ -111,16 +219,15 @@ class PackContext:
         files_list,
         dmanifest_data,
         zip_name,
-        manifest_data_resources,
         content_hashers,
         resources_list,
         common_files_list_name=None,
     ):
+        seen_entries = set()
         for filepath in files_list:
             file_info = self.files.get(filepath)
             if not file_info:
-                print(f"Warning: File info not found for {filepath}")
-                continue
+                raise Exception(f"File info not found for {filepath}")
             hex_digest = file_info.get("hexDigest")
             size = file_info.get("size")
             if not size:
@@ -150,16 +257,20 @@ class PackContext:
                     zinfo = zipfile.ZipInfo(
                         self.files[filepath]["hexDigest"], date_time=ZIP_EPOCH
                     )
-                    zinfo.compress_type = zipfile.ZIP_DEFLATED
+                    zinfo.compress_type = self.entry_compression(zip_file, file_contents)
                     zip_file.writestr(zinfo, file_contents)
+                    self.record_written(zip_file)
 
                     self.added_files[self.files[filepath]["hexDigest"]] = zip_name
 
-                    for resource_entry in manifest_data_resources[
-                        self.files[filepath]["hexDigest"]
-                    ]:
-                        dmanifest_data.resources.append(resource_entry)
-                        resources_list.append(resource_entry)
+            # Only this archive's paths: a foreign alias of the same digest would change version.
+            for resource_entry in self.entries_for_path(filepath):
+                key = (resource_entry.url, resource_entry.url_hash)
+                if key in seen_entries:
+                    continue
+                seen_entries.add(key)
+                dmanifest_data.resources.append(resource_entry)
+                resources_list.append(resource_entry)
 
             if common_files_list_name:
                 for main_file in self.common_files.get(filepath, {}).get("files", []):
@@ -191,7 +302,6 @@ class PackContext:
                 files_list,
                 self.dmanifest_data,
                 zip_name,
-                self.manifest_data_resources,
                 content_hashers,
                 resources_list,
                 common_files_list_name,
@@ -203,12 +313,14 @@ class PackContext:
             content_hashers["dmanifest"].update(dmanifest_bytes)
             content_hashers["all"].update(dmanifest_bytes)
             dmanifest_info = zipfile.ZipInfo(self.dmanifest_name, date_time=ZIP_EPOCH)
-            dmanifest_info.compress_type = zipfile.ZIP_DEFLATED
+            dmanifest_info.compress_type = self.entry_compression(zip_file, dmanifest_bytes)
             zip_file.writestr(dmanifest_info, dmanifest_bytes)
+            self.record_written(zip_file)
+        self.reject_oversized_archive(zip_path)
         content_hash_no_manifest = content_hashers["no_manifest"].hexdigest()
         version_hasher = hashlib.sha256()
         for resource_entry in sorted(
-            resources_list, key=lambda item: item.hash.data.hex()
+            resources_list, key=lambda item: (item.hash.data.hex(), item.url)
         ):
             version_hasher.update(resource_entry.SerializeToString())
         version_hasher.update(b"content_hash_no_manifest:")
@@ -219,6 +331,10 @@ class PackContext:
             "version_hash": version_hash,
             "size": os.path.getsize(zip_path),
         }
+        (
+            self.created_archives[common_zip_name]["file_md5"],
+            self.created_archives[common_zip_name]["file_md5_size"],
+        ) = self.compute_file_md5(zip_path)
 
     def get_deps_files(self, path, child_path=None):
         if child_path is None:
@@ -257,14 +373,7 @@ class PackContext:
         self.dmanifest_data = liveupdate_ddf_pb2.ManifestData()
         self.dmanifest_data.ParseFromString(self.dmanifest.data)
 
-        # One content hash may map to several ResourceEntry records (the same
-        # bytes referenced by different urls/url_hash). Keep them all so every
-        # url variant survives into the generated archive manifest.
-        self.manifest_data_resources = {}
-        for resource in self.dmanifest_data.resources:
-            self.manifest_data_resources.setdefault(
-                resource.hash.data.hex(), []
-            ).append(resource)
+        self.index_resources()
 
         data = self.load_json_file(self.graph_path)
         if data is None:
@@ -293,6 +402,72 @@ class PackContext:
                 and element["nodeType"] == "ExcludedCollectionProxy"
             ):
                 self.excluded_proxies[element["path"]] = element
+
+    def index_resources(self):
+        self.resources_by_url = {}
+        self.resources_by_url_hash = {}
+        self.resources_by_hash = {}
+        for resource in self.dmanifest_data.resources:
+            if resource.url:
+                self.resources_by_url.setdefault(resource.url, []).append(resource)
+            key = resource.url_hash & _MURMUR64_MASK
+            self.resources_by_url_hash.setdefault(key, []).append(resource)
+            self.resources_by_hash.setdefault(resource.hash.data.hex(), []).append(resource)
+
+    def entries_for_path(self, path):
+        # Some release url_hash values do not match hash64(graph path); the digest fallback covers them.
+        for candidate in (path, "/" + path.lstrip("/"), path.lstrip("/")):
+            found = self.resources_by_url.get(candidate)
+            if found:
+                return found
+        for candidate in (path, "/" + path.lstrip("/"), path.lstrip("/")):
+            found = self.resources_by_url_hash.get(path_url_hash(candidate))
+            if found:
+                return found
+        info = self.files.get(path) or self.files.get("/" + path.lstrip("/"))
+        digest = info.get("hexDigest") if info else None
+        if digest:
+            found = self.resources_by_hash.get(digest)
+            if found:
+                return found
+        raise Exception(
+            "No manifest entry for archive path "
+            f"{path}. The archive manifest keeps only its own urls."
+        )
+
+    def entries_for_paths(self, paths):
+        entries = []
+        seen = set()
+        for path in paths:
+            for entry in self.entries_for_path(path):
+                key = (entry.url, entry.url_hash)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append(entry)
+        return entries
+
+    def manifest_entries_weight(self, paths):
+        weight = 0
+        for path in paths:
+            for entry in self.entries_for_path(path):
+                weight += len(entry.SerializeToString()) + 3
+        return weight
+
+    def dmanifest_fixed_weight(self):
+        cached = getattr(self, "_dmanifest_fixed_weight", None)
+        if cached is not None:
+            return cached
+        if self.dmanifest is None or self.dmanifest_data is None:
+            return 0
+        data = liveupdate_ddf_pb2.ManifestData()
+        data.CopyFrom(self.dmanifest_data)
+        data.ClearField("resources")
+        manifest = liveupdate_ddf_pb2.ManifestFile()
+        manifest.CopyFrom(self.dmanifest)
+        manifest.data = data.SerializeToString()
+        self._dmanifest_fixed_weight = len(manifest.SerializeToString())
+        return self._dmanifest_fixed_weight
 
     def build_common_files(self):
         for path in self.zip_files:
@@ -408,8 +583,300 @@ class PackContext:
                     if name not in dependencies:
                         dependencies.append(name)
 
-    def write_planned_archives(self):
-        self.share_duplicate_content()
+    def is_common_archive_name(self, name):
+        return (
+            name.startswith("common_")
+            or name.startswith("common_texture_")
+            or name.startswith("common_sound_")
+        )
+
+    def estimated_archive_weight(self, paths):
+        if not paths:
+            return self.dmanifest_fixed_weight()
+        unique = {}
+        for path in paths:
+            info = self.files.get(path)
+            if not info or not info.get("hexDigest"):
+                continue
+            unique[info["hexDigest"]] = info["size"]
+        payload = sum(unique.values())
+        try:
+            entries = self.manifest_entries_weight(paths)
+        except Exception:
+            entries = 0
+        return payload + self.dmanifest_fixed_weight() + entries
+
+    def compression_mode_label(self):
+        return "store" if self.zip_store else "deflate"
+
+    def pack_name_for_members(self, member_names):
+        hasher = hashlib.sha256()
+        for name in sorted(member_names):
+            hasher.update(name.encode("utf-8"))
+            hasher.update(b"\0")
+        hasher.update(b"compression:")
+        hasher.update(self.compression_mode_label().encode("utf-8"))
+        return PACK_PREFIX + self.truncate_hash(hasher.hexdigest())
+
+    def build_merge_report_stats(self):
+        by_kind = {
+            "base": 0,
+            "texture": 0,
+            "sound": 0,
+            "common": 0,
+            "common_texture": 0,
+            "common_sound": 0,
+            "pack": 0,
+            "other": 0,
+        }
+        sizes = []
+        empty = 0
+        for name, paths in self.archive_files.items():
+            weight = self.estimated_archive_weight(paths)
+            sizes.append(weight)
+            if not paths:
+                empty += 1
+            if name.startswith(PACK_PREFIX):
+                by_kind["pack"] += 1
+            elif name.startswith("common_sound_"):
+                by_kind["common_sound"] += 1
+            elif name.startswith("common_texture_"):
+                by_kind["common_texture"] += 1
+            elif name.startswith("common_"):
+                by_kind["common"] += 1
+            elif name.endswith("_sound") or "_sound_" in name:
+                by_kind["sound"] += 1
+            elif name.endswith("_texture") or "_texture_" in name:
+                by_kind["texture"] += 1
+            else:
+                by_kind["base"] += 1
+        sizes.sort()
+        small_16 = sum(1 for size in sizes if size < 16 * 1024)
+        small_64 = sum(1 for size in sizes if size < 64 * 1024)
+        return {
+            "archive_count": len(self.archive_files),
+            "empty_bases": empty,
+            "by_kind": by_kind,
+            "bytes_total_estimate": sum(sizes),
+            "median_estimate": sizes[len(sizes) // 2] if sizes else 0,
+            "small_under_16kib": small_16,
+            "small_under_64kib": small_64,
+            "merged_packs": len(self.merged_archives),
+            "merged_members": sum(len(members) for members in self.merged_archives.values()),
+        }
+
+    def write_merge_report(self, report):
+        artifact_dir = os.path.join("dist", "output")
+        os.makedirs(artifact_dir, exist_ok=True)
+        artifact = os.path.join(artifact_dir, "merge_report.json")
+        with open(artifact, "w") as outfile:
+            json.dump(report, outfile, indent=4)
+        print(f"merge report: {artifact}")
+        before = report.get("before_merge") or report
+        print(
+            "merge stats: "
+            f"{before['archive_count']} archives, "
+            f"{before['small_under_64kib']} < 64 KiB, "
+            f"{before.get('merged_packs', 0)} packs "
+            f"({before.get('merged_members', 0)} members)"
+        )
+        after = report.get("after_merge")
+        if after:
+            print(
+                "after merge: "
+                f"{after['archive_count']} archives, "
+                f"{after['small_under_64kib']} < 64 KiB, "
+                f"{after['merged_packs']} packs "
+                f"({after['merged_members']} members)"
+            )
+
+    def module_order(self):
+        import liveupdate_collections_report
+
+        config = self.merge_config
+        modules = liveupdate_collections_report.parse_lua_modules(config["modules_lua"])
+        if modules is None:
+            raise ValueError(f"Modules source not found: {config['modules_lua']}")
+        order = {}
+        labels = {}
+        for index, module in enumerate(modules):
+            labels.setdefault(module["label"], index)
+            for file_name in module["files"]:
+                order.setdefault(self.collection_stem(file_name), (index, module["label"]))
+        patterns = []
+        for rule in config.get("module_patterns", []):
+            if rule["after"] not in labels:
+                raise ValueError(f"Unknown module in module_patterns: {rule['after']}")
+            patterns.append((rule["match"], labels[rule["after"]] + 0.5))
+        last = len(modules) + 1
+
+        def group_of(stem):
+            if stem in order:
+                return order[stem]
+            for match, position in patterns:
+                if fnmatch.fnmatch(stem + ".collectionc", match):
+                    return (position, stem)
+            return (last, stem)
+
+        return group_of
+
+    def collection_stem(self, path):
+        return os.path.splitext(os.path.basename(path))[0]
+
+    def archive_consumers(self):
+        consumers = {}
+        for proxy in self.zip_files:
+            collection = self.files[proxy]["children"][0]
+            consumers.setdefault(self.collection_name(collection), set()).add(self.collection_stem(collection))
+        for collection, dependencies in self.dependency_list.items():
+            for archive in dependencies:
+                consumers.setdefault(archive, set()).add(self.collection_stem(collection))
+        return consumers
+
+    def is_media_archive_name(self, name, kind):
+        return name.startswith(f"common_{kind}_") or name.endswith(f"_{kind}") or f"_{kind}_" in name
+
+    def module_rules(self, label):
+        config = self.merge_config
+        rules = {key: config[key] for key in MERGE_RULE_KEYS}
+        for pattern, override in config["modules"].items():
+            if fnmatch.fnmatch(label, pattern):
+                rules.update(override)
+        return rules
+
+    def is_excluded(self, name, stems):
+        for pattern in self.merge_config["exclude"]:
+            if fnmatch.fnmatch(name, pattern):
+                return True
+            if any(fnmatch.fnmatch(stem + ".collectionc", pattern) for stem in stems):
+                return True
+        return False
+
+    def mergeable_archives(self, consumers, textures):
+        for name, paths in sorted(self.archive_files.items()):
+            if name.startswith(PACK_PREFIX) or not paths or name not in consumers:
+                continue
+            if self.is_media_archive_name(name, "sound"):
+                continue
+            if not textures and self.is_media_archive_name(name, "texture"):
+                continue
+            if self.is_excluded(name, consumers[name]):
+                continue
+            yield name, list(paths)
+
+    def pack_bins(self, items, pack_limit, label):
+        bins = []
+        for weight, name, paths in sorted(items):
+            for bucket in bins:
+                combined = bucket["paths"] + paths
+                new_weight = self.estimated_archive_weight(combined)
+                if new_weight <= pack_limit:
+                    bucket["members"].append(name)
+                    bucket["paths"] = combined
+                    bucket["weight"] = new_weight
+                    break
+            else:
+                bins.append({"members": [name], "paths": list(paths), "weight": weight, "label": label})
+        return bins
+
+    def manual_pack_bins(self, consumers):
+        bins = []
+        claimed = set()
+        for rule in self.merge_config["packs"]:
+            collections = rule.get("collections", [])
+            archives = rule.get("archives", [])
+            max_archive = rule.get("max_archive_kib")
+            items = []
+            for name, paths in self.mergeable_archives(consumers, rule.get("textures", False)):
+                if name in claimed:
+                    continue
+                stems = consumers[name]
+                by_collection = bool(collections) and all(
+                    any(fnmatch.fnmatch(stem + ".collectionc", pattern) for pattern in collections)
+                    for stem in stems
+                )
+                by_name = any(fnmatch.fnmatch(name, pattern) for pattern in archives)
+                if not by_collection and not by_name:
+                    continue
+                weight = self.estimated_archive_weight(paths)
+                if max_archive is not None and weight >= max_archive * 1024:
+                    continue
+                items.append((weight, name, paths))
+                claimed.add(name)
+            pack_limit = min(rule.get("pack_limit_kib", self.merge_config["pack_limit_kib"]) * 1024, MERGE_SMALL_BUDGET)
+            bins.extend(self.pack_bins(items, pack_limit, rule["name"]))
+        return bins, claimed
+
+    def merge_small_archives(self):
+        group_of = self.module_order()
+        consumers = self.archive_consumers()
+        bins, claimed = self.manual_pack_bins(consumers)
+
+        groups = {}
+        for name, paths in self.mergeable_archives(consumers, True):
+            if name in claimed:
+                continue
+            group = min(group_of(stem) for stem in consumers[name])
+            rules = self.module_rules(group[1])
+            if not rules["enabled"]:
+                continue
+            if not rules["textures"] and self.is_media_archive_name(name, "texture"):
+                continue
+            weight = self.estimated_archive_weight(paths)
+            if weight >= rules["small_archive_kib"] * 1024:
+                continue
+            groups.setdefault(group, []).append((weight, name, paths))
+
+        for group in sorted(groups):
+            rules = self.module_rules(group[1])
+            pack_limit = min(rules["pack_limit_kib"] * 1024, MERGE_SMALL_BUDGET)
+            bins.extend(self.pack_bins(groups[group], pack_limit, group[1]))
+
+        renamed = {}
+        for bucket in bins:
+            if len(bucket["members"]) < 2:
+                continue
+            pack_name = self.pack_name_for_members(bucket["members"])
+            if pack_name in self.archive_files:
+                raise Exception(f"Pack name collision: {pack_name}")
+            for member in bucket["members"]:
+                del self.archive_files[member]
+                renamed[member] = pack_name
+            self.archive_files[pack_name] = bucket["paths"]
+            self.merged_archives[pack_name] = sorted(bucket["members"])
+            print(
+                f"Merged {len(bucket['members'])} archives -> {pack_name} "
+                f"[{bucket['label']}] (~{bucket['weight'] / 1024:.1f} KiB est.)"
+            )
+
+        if not renamed:
+            return
+
+        for collection, dependencies in list(self.dependency_list.items()):
+            rewritten = []
+            seen = set()
+            for dep in dependencies:
+                replacement = renamed.get(dep, dep)
+                if replacement not in seen:
+                    rewritten.append(replacement)
+                    seen.add(replacement)
+            self.dependency_list[collection] = rewritten
+
+    def write_planned_archives(self, share_duplicates=True, allow_merge=True):
+        # Low follows the high layout: a low-only common_* can shadow a mounted high.
+        if share_duplicates:
+            self.share_duplicate_content()
+        self.verify_one_path_one_archive()
+        report = {"before_merge": self.build_merge_report_stats(), "merge_config": self.merge_config}
+        if self.merge_config and allow_merge:
+            self.merge_small_archives()
+            self.verify_one_path_one_archive()
+            report["after_merge"] = self.build_merge_report_stats()
+            report["merged_archives"] = dict(self.merged_archives)
+        elif self.merged_archives:
+            report["after_merge"] = self.build_merge_report_stats()
+            report["merged_archives"] = dict(self.merged_archives)
+        self.write_merge_report(report)
         for name, paths in self.archive_files.items():
             self.create_zip_archive(name, paths)
 
@@ -417,29 +884,199 @@ class PackContext:
         print("Restoring from original files tree")
         original_files_tree = self.load_json_file("files_tree.json")
         manifest_output = original_files_tree["manifest"]
+        high_versions = dict(manifest_output.get("file_versions", {}))
+        high_deps = {
+            archive: list(names)
+            for archive, names in manifest_output.get("deps", {}).items()
+        }
+        self.merged_archives = {
+            pack: list(members)
+            for pack, members in (manifest_output.get("merged_archives") or {}).items()
+        }
         collections = {
             self.collection_name(self.files[proxy]["children"][0]):
             self.files[proxy]["children"][0]
             for proxy in self.zip_files
         }
         self.dependency_list = {}
-        for archive, names in manifest_output["deps"].items():
+        for archive, names in high_deps.items():
             for name in names:
-                self.dependency_list.setdefault(collections[name], []).append(archive)
+                collection = collections.get(name)
+                if collection is None:
+                    raise Exception(
+                        "High manifest depends on "
+                        f"{name}, which is not an excluded collection in this graph"
+                    )
+                self.dependency_list.setdefault(collection, []).append(archive)
         for name, info in original_files_tree["zip_files"].items():
             self.plan_zip_archive(name, [file["path"] for file in info["files"]])
 
-        # A different resolution may merge previously distinct content hashes.
-        # Reconcile owners/dependencies before replaying the saved layout.
-        self.write_planned_archives()
+        self.verify_restore_matches_tree(original_files_tree)
+        self.write_planned_archives(share_duplicates=False, allow_merge=False)
         self.rename_archives_to_version()
         restored_manifest = self.build_manifest_output()
-        for key in ("version", "deps", "file_versions", "file_sizes", "dmanifest_info"):
-            manifest_output[key] = restored_manifest[key]
+        self.verify_manifest_pair(
+            {"file_versions": high_versions, "deps": high_deps},
+            restored_manifest,
+        )
+        self.report_base_divergence(original_files_tree, high_versions, restored_manifest)
+        for key in (
+            "version",
+            "deps",
+            "file_versions",
+            "file_sizes",
+            "file_md5",
+            "file_md5_size",
+            "md5_chunk_size",
+            "merged_archives",
+            "dmanifest_info",
+        ):
+            if key in restored_manifest:
+                manifest_output[key] = restored_manifest[key]
         if self.client_version is not None:
             manifest_output["client_version"] = self.client_version
+        self.merged_archives = dict(restored_manifest.get("merged_archives") or {})
         self.write_outputs(manifest_output)
         os.remove("files_tree.json")
+
+    def packable_paths(self):
+        paths = []
+        seen = set()
+        for grouped in self.zip_files.values():
+            for path, info in grouped.items():
+                if path in seen or not info or not info.get("hexDigest"):
+                    continue
+                if info.get("isInMainBundle"):
+                    continue
+                seen.add(path)
+                paths.append(path)
+        return paths
+
+    def verify_one_path_one_archive(self):
+        owners = {}
+        for name, paths in self.archive_files.items():
+            for path in paths:
+                if path in owners:
+                    raise Exception(
+                        f"{path} is packed into both {owners[path]} and {name}"
+                    )
+                owners[path] = name
+        missing = [
+            path for path in self.packable_paths() if path not in owners
+        ]
+        if missing:
+            preview = ", ".join(missing[:20])
+            raise Exception(
+                f"{len(missing)} excluded path(s) are in no archive: {preview}"
+            )
+
+    def verify_restore_matches_tree(self, original_files_tree):
+        tree = original_files_tree["zip_files"]
+        planned_names = set(self.archive_files)
+        tree_names = set(tree)
+        if planned_names != tree_names:
+            raise Exception(
+                "Restored archive names differ from the high files tree: "
+                f"only in high {sorted(tree_names - planned_names)}, "
+                f"only in this resolution {sorted(planned_names - tree_names)}"
+            )
+        absent = []
+        for name, info in tree.items():
+            tree_paths = [item["path"] for item in info["files"]]
+            planned = self.archive_files[name]
+            if sorted(tree_paths) != sorted(planned):
+                raise Exception(f"Archive {name} paths differ from the high files tree")
+            for path in tree_paths:
+                if path not in self.files:
+                    absent.append(path)
+                    continue
+                self.entries_for_path(path)
+        if absent:
+            preview = ", ".join(absent[:20])
+            raise Exception(
+                f"{len(absent)} high-tree path(s) are missing from this graph: {preview}"
+            )
+
+    def verify_manifest_pair(self, high_manifest, low_manifest):
+        high_names = set(high_manifest.get("file_versions", {}))
+        low_names = set(low_manifest.get("file_versions", {}))
+        if high_names != low_names:
+            raise Exception(
+                "Archive name sets differ between resolutions: "
+                f"only in high {sorted(high_names - low_names)}, "
+                f"only in low {sorted(low_names - high_names)}"
+            )
+
+        def normalize(deps):
+            return {name: sorted(set(consumers)) for name, consumers in deps.items()}
+
+        high_deps = normalize(high_manifest.get("deps", {}))
+        low_deps = normalize(low_manifest.get("deps", {}))
+        if high_deps != low_deps:
+            raise Exception(
+                "Archive dependencies differ between resolutions: "
+                f"high {high_deps}, low {low_deps}"
+            )
+
+    def is_base_archive(self, name):
+        if name.startswith("common_texture_") or name.startswith("common_sound_"):
+            return False
+        if name.startswith("common_"):
+            return True
+        for kind in ("texture", "sound"):
+            if f"{COLLECTION_SUFFIX}_{kind}" in name:
+                return False
+        return True
+
+    def report_base_divergence(self, original_files_tree, high_versions, low_manifest):
+        diverged = []
+        for name, low_version in sorted(low_manifest.get("file_versions", {}).items()):
+            if not self.is_base_archive(name):
+                continue
+            high_version = high_versions.get(name)
+            if high_version == low_version:
+                continue
+            causes = []
+            unchanged = []
+            for item in original_files_tree["zip_files"].get(name, {}).get("files", []):
+                path = item["path"]
+                low_info = self.files.get(path) or {}
+                if item.get("hexDigest") != low_info.get("hexDigest"):
+                    causes.append(path)
+                else:
+                    unchanged.append(path)
+            diverged.append((name, high_version, low_version, causes, unchanged))
+
+        if not diverged:
+            print("Base archives: low and high versions match.")
+            return diverged
+
+        print(f"Base archives whose version differs between low and high: {len(diverged)}")
+        for name, high_version, low_version, causes, unchanged in diverged:
+            print(f"  {name}: high {high_version} low {low_version}")
+            if causes:
+                for path in causes:
+                    print(f"    {path}")
+            else:
+                print("    content hashes match; manifest entries differ")
+                for path in unchanged:
+                    print(f"    {path}")
+        return diverged
+
+    def check_proxy_root_basenames(self):
+        seen = {}
+        for proxy, element in self.excluded_proxies.items():
+            children = element.get("children") or []
+            if not children:
+                raise Exception(f"Excluded collection proxy has no root collection: {proxy}")
+            root = children[0]
+            name = self.collection_name(root)
+            if name in seen:
+                raise Exception(
+                    "Excluded collection proxies share archive name "
+                    f"{name}: {seen[name]} and {root}"
+                )
+            seen[name] = root
 
     def resource_units(self, file_keys, related_groups=None):
         # Aliases, texture pairs and sound/audio edges form indivisible units.
@@ -486,15 +1123,17 @@ class PackContext:
         if MAX_ARCHIVE_SIZE <= 0:
             return [list(file_keys)]
 
-        chunks, chunk, size = [], [], 0
+        chunks, chunk, payload, manifest_weight = [], [], 0, self.dmanifest_fixed_weight()
         for keys in self.resource_units(file_keys):
             unique_files = {self.files[key]["hexDigest"]: self.files[key] for key in keys}
-            unit_size = sum(info["size"] for info in unique_files.values())
-            if chunk and size + unit_size > MAX_ARCHIVE_SIZE:
+            unit_payload = sum(info["size"] for info in unique_files.values())
+            unit_manifest = self.manifest_entries_weight(keys)
+            if chunk and payload + unit_payload + manifest_weight + unit_manifest > MAX_ARCHIVE_SIZE:
                 chunks.append(chunk)
-                chunk, size = [], 0
+                chunk, payload, manifest_weight = [], 0, self.dmanifest_fixed_weight()
             chunk.extend(keys)
-            size += unit_size
+            payload += unit_payload
+            manifest_weight += unit_manifest
         if chunk:
             chunks.append(chunk)
         return chunks
@@ -525,20 +1164,17 @@ class PackContext:
         return stem + COLLECTION_SUFFIX
 
     def compute_version_hash_from_files(self, files_list):
-        version_hasher = hashlib.sha256()
-        resources = []
-        seen_digests = set()
         for filepath in files_list:
             file_info = self.files.get(filepath)
             if not file_info:
-                continue
-            hex_digest = file_info.get("hexDigest")
-            if not hex_digest:
+                raise Exception(f"File info not found for {filepath}")
+            if not file_info.get("hexDigest"):
                 raise Exception(f"Missing hexDigest for file: {filepath}")
-            if hex_digest not in seen_digests:
-                resources.extend(self.manifest_data_resources[hex_digest])
-                seen_digests.add(hex_digest)
-        for resource_entry in sorted(resources, key=lambda item: item.hash.data.hex()):
+        version_hasher = hashlib.sha256()
+        for resource_entry in sorted(
+            self.entries_for_paths(files_list),
+            key=lambda item: (item.hash.data.hex(), item.url),
+        ):
             version_hasher.update(resource_entry.SerializeToString())
         return self.truncate_hash(version_hasher.hexdigest())
 
@@ -646,8 +1282,15 @@ class PackContext:
             "deps": {},
             "file_versions": self.build_file_versions(),
             "file_sizes": self.build_file_sizes(),
+            "file_md5": self.build_file_md5(),
+            "file_md5_size": self.build_file_md5_size(),
+            "md5_chunk_size": MD5_CHUNK_SIZE,
             "dmanifest_info": self.build_dmanifest_info(),
         }
+        if self.merged_archives:
+            manifest_output["merged_archives"] = {
+                pack: list(members) for pack, members in sorted(self.merged_archives.items())
+            }
         if self.client_version is not None:
             manifest_output["client_version"] = self.client_version
 
@@ -665,21 +1308,46 @@ class PackContext:
         with open(os.path.join(self.result_folder, "manifest.json"), "w") as outfile:
             json.dump(manifest_output, outfile, indent=4)
 
+        self.write_files_tree(manifest_output)
+        self.create_debug_files()
+
+    def write_files_tree(self, manifest_output):
+        # Not in liveupdate_zip/: that folder is published to the CDN.
         self.files_tree["manifest"] = manifest_output
         with open("files_tree.json", "w") as outfile:
             json.dump(self.files_tree, outfile, indent=4)
-
-        with open(os.path.join(self.result_folder, "files_tree.json"), "w") as outfile:
+        if self.restore_from_tree:
+            return
+        artifact_dir = os.path.join("dist", "output")
+        os.makedirs(artifact_dir, exist_ok=True)
+        artifact = os.path.join(artifact_dir, "files_tree.json")
+        with open(artifact, "w") as outfile:
             json.dump(self.files_tree, outfile, indent=4)
+        print(f"files_tree artifact: {artifact}")
 
-        self.create_debug_files()
-
-    def compute_file_hash(self, file_path):
-        hasher = hashlib.sha256()
+    def compute_file_md5(self, file_path):
+        size = self.md5_covered_size(file_path)
+        parts = []
         with open(file_path, "rb") as file_obj:
-            for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
+            left = size
+            while left > 0:
+                chunk = file_obj.read(min(MD5_CHUNK_SIZE, left))
+                if not chunk:
+                    break
+                parts.append(hashlib.md5(chunk).hexdigest())
+                left -= len(chunk)
+        return hashlib.md5("".join(parts).encode()).hexdigest(), size
+
+    def md5_covered_size(self, file_path):
+        with zipfile.ZipFile(file_path) as bundle:
+            entries = bundle.infolist()
+        manifests = [entry for entry in entries if entry.filename == self.dmanifest_name]
+        if not manifests:
+            return os.path.getsize(file_path)
+        offset = manifests[0].header_offset
+        if any(entry.header_offset > offset for entry in entries):
+            raise ValueError(f"{file_path}: {self.dmanifest_name} must be the last zip entry")
+        return offset
 
     def rename_archives_to_version(self):
         for common_name, archive_info in self.created_archives.items():
@@ -708,6 +1376,18 @@ class PackContext:
         for common_name, archive_info in self.created_archives.items():
             file_sizes[common_name] = archive_info["size"]
         return file_sizes
+
+    def build_file_md5(self):
+        file_md5 = {}
+        for common_name, archive_info in self.created_archives.items():
+            file_md5[common_name] = archive_info["file_md5"]
+        return file_md5
+
+    def build_file_md5_size(self):
+        file_md5_size = {}
+        for common_name, archive_info in self.created_archives.items():
+            file_md5_size[common_name] = archive_info["file_md5_size"]
+        return file_md5_size
 
     def build_dmanifest_info(self):
         header = self.dmanifest_data.header
@@ -756,6 +1436,7 @@ class PackContext:
 
         for proxy_path in self.excluded_proxies:
             self.get_deps_files(proxy_path)
+        self.check_proxy_root_basenames()
 
         if not os.path.exists(self.result_folder):
             os.makedirs(self.result_folder)
@@ -779,14 +1460,93 @@ class PackContext:
         print("Process completed successfully.")
 
 
+def load_merge_config(data):
+    merge = data.get("merge")
+    if not merge or not merge.get("enabled", True):
+        return None
+    check_keys("merge", merge, MERGE_KEYS)
+    if not merge.get("modules_lua"):
+        raise ValueError("merge.modules_lua: need the client modules file")
+    config = {
+        "modules_lua": merge["modules_lua"],
+        "module_patterns": list(merge.get("module_patterns", [])),
+        "enabled": True,
+        "small_archive_kib": int(merge.get("small_archive_kib", 64)),
+        "pack_limit_kib": int(merge.get("pack_limit_kib", 4096)),
+        "textures": bool(merge.get("textures", False)),
+        "modules": {},
+        "packs": [],
+        "exclude": [str(pattern) for pattern in merge.get("exclude", [])],
+    }
+    check_limits("merge", config)
+    for rule in config["module_patterns"]:
+        check_keys("merge.module_patterns", rule, ("match", "after"))
+    for pattern, override in merge.get("modules", {}).items():
+        check_keys(f"merge.modules.{pattern}", override, MERGE_RULE_KEYS)
+        rules = {key: config[key] for key in MERGE_RULE_KEYS}
+        rules.update(override)
+        check_limits(f"merge.modules.{pattern}", rules)
+        config["modules"][pattern] = dict(override)
+    names = set()
+    for rule in merge.get("packs", []):
+        check_keys("merge.packs", rule, ("name", "collections", "archives", "max_archive_kib", "pack_limit_kib", "textures"))
+        name = rule.get("name")
+        if not name or name in names:
+            raise ValueError(f"merge.packs: need a unique name, got {name!r}")
+        if not rule.get("collections") and not rule.get("archives"):
+            raise ValueError(f"merge.packs.{name}: need collections or archives")
+        names.add(name)
+        config["packs"].append(dict(rule))
+    return config
+
+
+def read_merge_config(path):
+    if not os.path.isfile(path):
+        print(f"merge: {path} not found")
+        return None
+    with open(path) as config_file:
+        text = config_file.read()
+    if not text.strip():
+        return None
+    return load_merge_config(json.loads(text))
+
+
+def check_keys(where, section, allowed):
+    unknown = sorted(set(section) - set(allowed))
+    if unknown:
+        raise ValueError(f"{where}: unknown keys {unknown}")
+
+
+def check_limits(where, rules):
+    if rules["small_archive_kib"] <= 0 or rules["pack_limit_kib"] <= rules["small_archive_kib"]:
+        raise ValueError(f"{where}: need 0 < small_archive_kib < pack_limit_kib")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--restore_from_tree", action="store_true")
     parser.add_argument("--client-version")
+    parser.add_argument(
+        "--zip-store",
+        action="store_true",
+        help="store archives up to 24 MiB, deflate after that, reject a file over 25 MiB",
+    )
+    parser.add_argument(
+        "--merge-config",
+        help="JSON with a \"merge\" section: small archives into pack_* per client module; writes merge_report.json",
+    )
     options = parser.parse_args()
     if options.client_version is not None and not options.client_version.strip():
         parser.error("--client-version must be a non-empty string")
-    PackContext(options.restore_from_tree, options.client_version).run()
+    merge_config = None
+    if options.merge_config:
+        merge_config = read_merge_config(options.merge_config)
+    PackContext(
+        options.restore_from_tree,
+        options.client_version,
+        options.zip_store,
+        merge_config,
+    ).run()
 
 
 if __name__ == "__main__":
