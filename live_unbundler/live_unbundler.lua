@@ -36,6 +36,8 @@ end
 ---@field res_mode liveupdater.res_mode?
 ---@field by_request boolean?
 ---@field processed boolean?
+---@field focus_low number? set by M.focus, overrides priority for the low resolution
+---@field focus_high number? set by M.focus, overrides priority for the high resolution
 
 ---@class liveupdater.file_version_info
 ---@field version string
@@ -46,6 +48,10 @@ end
 ---@field deps table<string, string[]>
 ---@field file_versions table<string, liveupdater.file_version_info|string>
 ---@field file_sizes table<string, integer>?
+---@field file_md5 table<string, string>? chunked md5 of each .arcd0; absent → no cache check
+---@field md5_chunk_size integer? chunk size of file_md5: hashmd5 of the concatenated hex md5 of each chunk
+---@field file_md5_size table<string, integer>? bytes covered by file_md5: the archive up to its dmanifest entry
+---@field merged_archives table<string, string[]>? pack name -> member archive names
 
 ---@class liveupdater.manifest_group
 ---@field lowres liveupdater.manifest? present only when the lowres resolution is active
@@ -55,6 +61,11 @@ end
 ---@class liveupdater.manifest_side
 ---@field versions table<string, string> archive name -> version hash
 ---@field sizes table<string, integer> archive name -> archive size in bytes (0 if the manifest has no sizes)
+---@field md5 table<string, string> archive name -> chunked md5 of .arcd0 (empty when manifest has no file_md5)
+---@field md5_chunk_size integer
+---@field md5_size table<string, integer> archive name -> bytes covered by md5
+---@field merged_into table<string, string> member archive name -> pack name
+---@field pack_set table<string, boolean> set of pack archive names from merged_archives
 ---@field dep_lists table<string, string[]> collection file -> dependency archive names
 ---@field dep_set table<string, boolean> set of all dependency archive names
 ---@field path string server path for this resolution
@@ -82,6 +93,10 @@ end
 ---@field remount boolean?
 ---@field order integer?
 ---@field reason string?
+---@field download_class integer? M.DOWNLOAD_CLASS.*, set when the item is queued
+---@field verify_attempts integer?
+---@field mount_attempts integer?
+---@field retry_at number?
 
 ---@class liveupdater.module_file_progress
 ---@field name string
@@ -101,6 +116,14 @@ end
 ---@class liveupdater.download_progress: liveupdater.resolution_progress
 ---@field low liveupdater.resolution_progress
 ---@field high liveupdater.resolution_progress
+---@field gate liveupdater.resolution_progress
+---@field downloading liveupdater.active_download[]
+
+---@class liveupdater.active_download
+---@field key string
+---@field size number
+---@field bytes number
+---@field in_gate boolean
 
 ---At least one of lowres_server_path / hires_server_path must be provided. When
 ---only one is provided that resolution is the only active one: res_mode on the
@@ -218,6 +241,55 @@ M.RES_HIGH_ONLY = RES_HIGH_ONLY
 M.RES_LOW_ONLY = RES_LOW_ONLY
 M.RES_BOTH = RES_BOTH
 
+M.PRIORITY_IDS = {
+	BLOCKING = 1,
+	FOCUS = 2,
+	PREFETCH = 3,
+	BACKGROUND = 4,
+}
+
+---Smaller numbers download earlier.
+M.PRIORITY = {
+	[M.PRIORITY_IDS.BLOCKING] = { low = 0, high = 500 },
+	[M.PRIORITY_IDS.FOCUS] = { low = 1, high = 500 },
+	[M.PRIORITY_IDS.PREFETCH] = { low = 600, high = 1500 },
+	[M.PRIORITY_IDS.BACKGROUND] = { low = 2000, high = 3000 },
+}
+
+local HIGH_PRIORITY_OFFSET = 1000
+local DEPENDENCY_PRIORITY_OFFSET = 0.5
+local RETRY_DELAY = 5
+local MAX_RETRY_DELAY = 60
+local ZIP_URI_PREFIX = "zip:"
+
+---Parallel download slot classes. A smaller id keeps the slot when two claims share a priority.
+M.DOWNLOAD_CLASS = {
+	BLOCKING = 1,
+	BOOT = 2,
+	OTHER = 3,
+}
+
+---Resolution ids. Values double as session_bytes and progress keys (.low / .high).
+M.RESOLUTION = {
+	LOW = "low",
+	HIGH = "high",
+}
+
+---Module status, worst first: a module shows the smallest id across its files and dependencies.
+M.STATUS = {
+	ABSENT = 1,
+	NOT_REQUESTED = 2,
+	QUEUED = 3,
+	DOWNLOADING = 4,
+	MOUNTING = 5,
+	READY = 6,
+}
+
+M.IN_FLIGHT_PHASE = {
+	DOWNLOADING = M.STATUS.DOWNLOADING,
+	MOUNTING = M.STATUS.MOUNTING,
+}
+
 local LOWRES_PREFIX = "lowres_"
 local HIGH_PREFIX = "high_"
 local NOTLOAD_PREFIX = "notloaded_"
@@ -243,6 +315,13 @@ local local_folder = "liveupdate_zip"
 ---@type integer
 local max_attempts = 3
 
+---@type integer
+local parallel_downloads = 1
+local PARALLEL_DOWNLOADS_MAX = 4
+---@type boolean
+local verify_hashes = true
+local DISK_POST_QUEUE_LIMIT = 6
+
 ---@type table<string, liveupdater.file_progress>
 local downloadable_files = {}
 ---@type table<string, string>
@@ -257,12 +336,148 @@ local download_files_queue = {}
 local download_queue_index = {}
 ---@type integer
 local download_queue_order = 0
----key of the queue item currently being downloaded/mounted
----@type string?
-local in_flight_key = nil
----bytes received so far for the in-flight item, clamped to its manifest size
----@type integer
-local in_flight_bytes = 0
+
+---@class liveupdater.in_flight_state
+---@field item liveupdater.queue_item
+---@field bytes integer
+---@field phase integer M.IN_FLIGHT_PHASE.*
+
+---@type table<string, liveupdater.in_flight_state>
+local in_flight = {}
+
+---@class liveupdater.mount_job
+---@field load_info liveupdater.queue_item
+---@field dl_name string?
+---@field size_ok boolean?
+
+---@type liveupdater.mount_job[]
+local mount_queue = {}
+---@type boolean
+local mount_busy = false
+---@type boolean
+local mount_pump_scheduled = false
+
+---@type table<string, boolean>
+local mounting_files = {}
+
+---@type table<string, string>
+local remount_pending = {}
+
+---@type table<string, boolean>
+local pinned_archives = {}
+
+---@type table<string, string[]>
+local pinned_modules = {}
+
+---@class liveupdater.staged_high
+---@field load_info liveupdater.queue_item
+---@field pending_name string
+---@field mounted boolean
+
+---@type table<string, liveupdater.staged_high>
+local staged_high = {}
+
+---@type liveupdater.staged_high[]
+local promote_jobs = {}
+
+---@type fun()?
+local promote_on_done
+
+local REMOUNT_PENDING_SUFFIX = ".__lu_pending"
+local DOWNLOAD_TEMP_SUFFIX = ".__lu_dl"
+local COPY_CHUNK_SIZE = 65536
+local POST_BUDGET_SEC = 0.004
+local POST_BUDGET_MIN_SEC = 0.001
+local POST_BUDGET_MAX_SEC = 0.016
+
+local bench_log_enabled = false
+
+---@param enabled boolean
+function M.set_bench_log(enabled)
+	bench_log_enabled = enabled == true
+end
+
+---@param event string
+---@param details string?
+function M.bench_mark(event, details)
+	if not bench_log_enabled then
+		return
+	end
+	if details then
+		print(string.format("LU_BENCH event=%s %s", event, details))
+	else
+		print(string.format("LU_BENCH event=%s", event))
+	end
+end
+
+---@param phase string
+---@param name string
+---@param ms number
+---@param bytes integer?
+local function log_timing(phase, name, ms, bytes)
+	log.debug("LU_TIMING phase=%s name=%s ms=%.1f", phase, name, ms)
+	if not bench_log_enabled then
+		return
+	end
+	if bytes and bytes > 0 then
+		M.bench_mark("timing", string.format("phase=%s name=%s ms=%.1f bytes=%d", phase, name, ms, bytes))
+	else
+		M.bench_mark("timing", string.format("phase=%s name=%s ms=%.1f", phase, name, ms))
+	end
+end
+
+---@param filename string
+---@return string
+local function download_temp_name(filename)
+	return filename .. DOWNLOAD_TEMP_SUFFIX
+end
+
+---@type table<hash, {uri: string, priority: number}>
+local mounts_by_hash = {}
+---@type number
+local max_mount_priority = 0
+
+---@type table<string, table<string, {priority: number, class: string}>>
+local queue_requesters = {}
+
+---@param enabled boolean
+function M.set_verify_hashes(enabled)
+	verify_hashes = enabled ~= false
+end
+
+---@param count integer?
+function M.set_parallel_downloads(count)
+	if type(count) ~= "number" or count < 1 then
+		parallel_downloads = 1
+		return
+	end
+	parallel_downloads = math.min(math.floor(count), PARALLEL_DOWNLOADS_MAX)
+end
+
+---@return integer
+function M.get_parallel_downloads()
+	return parallel_downloads
+end
+
+---@param sec number?
+function M.set_post_budget(sec)
+	if type(sec) ~= "number" or sec ~= sec then
+		POST_BUDGET_SEC = 0.004
+		return
+	end
+	if sec < POST_BUDGET_MIN_SEC then
+		POST_BUDGET_SEC = POST_BUDGET_MIN_SEC
+	elseif sec > POST_BUDGET_MAX_SEC then
+		POST_BUDGET_SEC = POST_BUDGET_MAX_SEC
+	else
+		POST_BUDGET_SEC = sec
+	end
+end
+
+---@return number
+function M.get_post_budget()
+	return POST_BUDGET_SEC
+end
 
 ---bytes queued and completed in the current download session, per resolution
 ---@type table<liveupdater.resolution, {total: integer, downloaded: integer}>
@@ -276,6 +491,9 @@ local files_load_completed = false
 ---is_module_loaded results, valid until the next saved_list change
 ---@type table<string, boolean>
 local module_loaded_memo = {}
+
+---@type table<string, boolean>
+local modules_announced_loaded = {}
 
 ---@return boolean
 local function is_liveupdate_available()
@@ -297,25 +515,93 @@ local function get_local_path(filename)
 end
 
 ---@param filename string
----@param data string
+---@return string
+local function zip_mount_uri(filename)
+	return ZIP_URI_PREFIX .. get_local_path(filename)
+end
+
+---@param filename string
+---@return boolean?, string?
+local function remove_local_file(filename)
+	if sys.exists(get_local_path(filename)) then
+		return os.remove(get_local_path(filename))
+	else
+		return true, nil
+	end
+end
+
+---@param from_name string
+---@param to_name string
 ---@return boolean, string?
-local function save_file(filename, data)
-	local path = get_local_path(filename)
-	local file, err = io.open(path, "w+")
-	if err or not file then
-		return false, err
+local function copy_local_file(from_name, to_name)
+	local from_path = get_local_path(from_name)
+	local to_path = get_local_path(to_name)
+	local src, src_err = io.open(from_path, "rb")
+	if not src then
+		return false, src_err
 	end
-	local f, err = file:write(data)
-	if err then
-		return false, err
+	local dst, dst_err = io.open(to_path, "wb")
+	if not dst then
+		src:close()
+		return false, dst_err
 	end
-	file:close()
+	while true do
+		local chunk = src:read(COPY_CHUNK_SIZE)
+		if not chunk then
+			break
+		end
+		local ok, write_err = dst:write(chunk)
+		if not ok then
+			src:close()
+			dst:close()
+			return false, write_err
+		end
+	end
+	src:close()
+	dst:close()
 	return true, nil
 end
+
+---@param from_name string
+---@param to_name string
+---@return boolean, string?
+local function move_local_file(from_name, to_name)
+	if from_name == to_name then
+		return true, nil
+	end
+	remove_local_file(to_name)
+	local from_path = get_local_path(from_name)
+	local to_path = get_local_path(to_name)
+	local renamed, rename_err = os.rename(from_path, to_path)
+	if renamed then
+		return true, nil
+	end
+	local copied, copy_err = copy_local_file(from_name, to_name)
+	if not copied then
+		return false, copy_err or rename_err
+	end
+	remove_local_file(from_name)
+	return true, nil
+end
+
+---@class liveupdater.cache_md5_state
+---@field md5 string
+---@field ok boolean?
+---@field failed boolean?
+---@field retried boolean?
+
+---@type table<string, liveupdater.cache_md5_state>
+local cache_md5 = {}
+
+---@type table<string, string>
+local staged_versions = {}
+local staged_restored = false
 
 local function save_local_files_list()
 	local data = {
 		saved_list = M.saved_list,
+		cache_md5 = cache_md5,
+		staged_versions = staged_versions,
 	}
 	local success, err = pcall(sys.save, M.save_cache_key, data)
 	if not success then
@@ -328,6 +614,8 @@ local function load_local_files_list()
 	if not M.saved_list then
 		local data = sys.load(M.save_cache_key)
 		M.saved_list = data.saved_list or {}
+		cache_md5 = data.cache_md5 or {}
+		staged_versions = data.staged_versions or {}
 	end
 end
 
@@ -346,13 +634,40 @@ local function file_exists(filename)
 end
 
 ---@param filename string
----@return boolean?, string?
-local function remove_local_file(filename)
-	if sys.exists(get_local_path(filename)) then
-		return os.remove(get_local_path(filename))
-	else
-		return true, nil
+---@param saved_version string?
+---@return string? md5
+---@return integer? chunk_size
+---@return integer? size
+local function get_expected_md5(filename, saved_version)
+	assert(manifest_cache, "Liveupdater: manifest cache not built")
+	local accepted = {}
+	local chunk_size = nil
+	local size = nil
+	for _, side in pairs({ manifest_cache.low, manifest_cache.high }) do
+		local md5 = side.versions[filename] == saved_version and side.md5_size[filename] and side.md5[filename]
+		if md5 and md5 ~= accepted[1] then
+			accepted[#accepted + 1] = md5
+			chunk_size = chunk_size or side.md5_chunk_size
+			size = size or side.md5_size[filename]
+		end
 	end
+	if not accepted[1] then
+		return nil, nil, nil
+	end
+	table.sort(accepted)
+	return table.concat(accepted, "|"), chunk_size, size
+end
+
+---@param expected string
+---@param actual string
+---@return boolean
+local function md5_accepted(expected, actual)
+	for md5 in string.gmatch(expected, "[^|]+") do
+		if md5 == actual then
+			return true
+		end
+	end
+	return false
 end
 
 ---@param data string?
@@ -367,48 +682,83 @@ local function decode_json_data(data)
 	end
 end
 
+local function rebuild_mounts_index()
+	mounts_by_hash = {}
+	max_mount_priority = 0
+	for _, mount in ipairs(liveupdate.get_mounts()) do
+		mounts_by_hash[mount.name] = { uri = mount.uri, priority = mount.priority }
+		if mount.priority > max_mount_priority then
+			max_mount_priority = mount.priority
+		end
+	end
+end
+
 ---@param filename string
 ---@return boolean
 local function is_mount_exist(filename)
-	local name = hash(filename)
-	for _, mount in ipairs(liveupdate.get_mounts()) do
-		if mount.name == name then
-			return true
-		end
-	end
-	return false
+	return mounts_by_hash[hash(filename)] ~= nil
 end
 
 ---@return integer
 local function get_next_priority()
-	local max_priority = 0
-	for _, mount in ipairs(liveupdate.get_mounts()) do
-		if mount.priority > max_priority then
-			max_priority = mount.priority
-		end
+	max_mount_priority = max_mount_priority + 1
+	return max_mount_priority
+end
+
+---@param filename string
+local function unregister_mount(filename)
+	mounts_by_hash[hash(filename)] = nil
+end
+
+---@param filename string
+---@param uri string
+---@param priority number
+local function register_mount(filename, uri, priority)
+	mounts_by_hash[hash(filename)] = { uri = uri, priority = priority }
+	if priority > max_mount_priority then
+		max_mount_priority = priority
 	end
-	return max_priority + 1
+end
+
+---@param filename string
+---@return boolean
+local function remove_engine_mount(filename)
+	if not is_mount_exist(filename) then
+		return true
+	end
+	if liveupdate.remove_mount(filename) ~= liveupdate.LIVEUPDATE_OK then
+		log.error("Unable to remove mount %s", filename)
+		return false
+	end
+	unregister_mount(filename)
+	return true
 end
 
 ---@param filename string
 ---@param cb fun(success: boolean)?
 local function mount_resource(filename, cb)
-	if is_mount_exist(filename) then
-		if liveupdate.remove_mount(filename) ~= liveupdate.LIVEUPDATE_OK then
-			error("Unable to remove mount " .. filename)
+	local uri = zip_mount_uri(filename)
+	local existing = mounts_by_hash[hash(filename)]
+	if existing and existing.uri == uri then
+		if cb then
+			cb(true)
 		end
+		return
+	end
+	if existing and not remove_engine_mount(filename) then
+		error("Unable to remove mount " .. filename)
 	end
 
-	liveupdate.add_mount(
-		filename,
-		"zip:" .. get_local_path(filename),
-		get_next_priority(),
-		function(self, path, uri, result)
-			if cb then
-				cb(result == liveupdate.LIVEUPDATE_OK)
-			end
+	local priority = get_next_priority()
+	liveupdate.add_mount(filename, uri, priority, function(_, _, _, result)
+		local ok = result == liveupdate.LIVEUPDATE_OK
+		if ok then
+			register_mount(filename, uri, priority)
 		end
-	)
+		if cb then
+			cb(ok)
+		end
+	end)
 end
 
 ---@param prefix string
@@ -457,9 +807,8 @@ local function request_data(prefix, path, filename, basename, cb, attempt, versi
 				and response.response ~= nil
 			then
 				cb(true, response.response)
-			elseif attempt <= max_attempts then
-				attempt = attempt + 1
-				request_data(prefix, path, filename, basename, cb, attempt, version, progress_cb)
+			elseif attempt < max_attempts then
+				request_data(prefix, path, filename, basename, cb, attempt + 1, version, progress_cb)
 			else
 				cb(false, response.error)
 			end
@@ -473,6 +822,58 @@ local function request_data(prefix, path, filename, basename, cb, attempt, versi
 	)
 end
 
+---@param prefix string
+---@param path string
+---@param filename string
+---@param basename string
+---@param cb fun(success: boolean, dl_name: string?)
+---@param attempt integer?
+---@param version string?
+---@param progress_cb fun(bytes_received: number, bytes_total: number)?
+local function request_archive_file(prefix, path, filename, basename, cb, attempt, version, progress_cb)
+	attempt = attempt or 1
+	version = version or tostring(math.floor(socket.gettime()))
+	local dl_name = download_temp_name(basename)
+	local dest_path = get_local_path(dl_name)
+	remove_local_file(dl_name)
+	http.request(
+		path .. filename .. "?" .. version,
+		"GET",
+		function(self, id, response)
+			if
+				progress_cb
+				and response.bytes_total ~= nil
+				and response.response == nil
+				and response.error == nil
+				and (response.status == nil or response.status == 0)
+			then
+				progress_cb(response.bytes_received or 0, response.bytes_total)
+				return
+			end
+			local stored_ok = (response.status == 200 or response.status == 304)
+				and response.error == nil
+				and sys.exists(dest_path)
+			if stored_ok then
+				cb(true, dl_name)
+			elseif attempt < max_attempts then
+				remove_local_file(dl_name)
+				request_archive_file(prefix, path, filename, basename, cb, attempt + 1, version, progress_cb)
+			else
+				remove_local_file(dl_name)
+				cb(false, nil)
+			end
+		end,
+		nil,
+		nil,
+		{
+			timeout = 200,
+			report_progress = progress_cb ~= nil,
+			path = dest_path,
+			ignore_cache = true,
+		}
+	)
+end
+
 ---@param manifest liveupdater.manifest
 ---@param path string
 ---@param prefix string
@@ -480,7 +881,11 @@ end
 local function build_manifest_side(manifest, path, prefix)
 	local versions = {}
 	local sizes = {}
+	local md5 = {}
+	local md5_size = {}
 	local file_sizes = manifest.file_sizes or {}
+	local file_md5 = manifest.md5_chunk_size and manifest.file_md5_size and manifest.file_md5 or {}
+	local file_md5_size = manifest.file_md5_size or {}
 	for file_name, info in pairs(manifest.file_versions) do
 		if type(info) == "table" then
 			versions[file_name] = info.version
@@ -489,6 +894,17 @@ local function build_manifest_side(manifest, path, prefix)
 			versions[file_name] = info
 			-- legacy manifests have no file_sizes, size stays unknown
 			sizes[file_name] = file_sizes[file_name] or 0
+		end
+		md5[file_name] = file_md5[file_name]
+		md5_size[file_name] = file_md5_size[file_name]
+	end
+
+	local merged_into = {}
+	local pack_set = {}
+	for pack_name, members in pairs(manifest.merged_archives or {}) do
+		pack_set[pack_name] = true
+		for _, member in ipairs(members) do
+			merged_into[member] = pack_name
 		end
 	end
 
@@ -507,11 +923,23 @@ local function build_manifest_side(manifest, path, prefix)
 	return {
 		versions = versions,
 		sizes = sizes,
+		md5 = md5,
+		md5_chunk_size = manifest.md5_chunk_size or 0,
+		md5_size = md5_size,
+		merged_into = merged_into,
+		pack_set = pack_set,
 		dep_lists = dep_lists,
 		dep_set = dep_set,
 		path = path,
 		prefix = prefix,
 	}
+end
+
+---@param side liveupdater.manifest_side
+---@param archive_name string
+---@return string
+local function resolve_archive_name(side, archive_name)
+	return side.merged_into[archive_name] or archive_name
 end
 
 ---@param manifest_group liveupdater.manifest_group
@@ -523,13 +951,89 @@ local function build_manifest_cache(manifest_group)
 	}
 end
 
+---@param side liveupdater.manifest_side?
+---@param archive_name string
+---@return string? version, string resolved_name
+local function side_archive_version(side, archive_name)
+	if not side then
+		return nil, archive_name
+	end
+	local resolved = resolve_archive_name(side, archive_name)
+	return side.versions[resolved], resolved
+end
+
 ---@param file_name string
 ---@return string? low_version, string? high_version
 local function get_actual_versions(file_name)
 	assert(manifest_cache, "Liveupdater: manifest cache not built")
-	local low_version = manifest_cache.low and manifest_cache.low.versions[file_name]
-	local high_version = manifest_cache.high and manifest_cache.high.versions[file_name]
+	local low_version = side_archive_version(manifest_cache.low, file_name)
+	local high_version = side_archive_version(manifest_cache.high, file_name)
 	return low_version or nil, high_version or nil
+end
+
+---@return liveupdater.manifest_side[]
+local function active_manifest_sides()
+	local sides = {}
+	if not manifest_cache then
+		return sides
+	end
+	if manifest_cache.low then
+		sides[#sides + 1] = manifest_cache.low
+	end
+	if manifest_cache.high then
+		sides[#sides + 1] = manifest_cache.high
+	end
+	return sides
+end
+
+---@param module liveupdater.module
+---@return string[]
+local function module_archive_names(module)
+	local names = {}
+	local seen = {}
+	local function add(name)
+		if name and not seen[name] then
+			seen[name] = true
+			names[#names + 1] = name
+		end
+	end
+	for _, file_name in ipairs(module.files) do
+		for _, side in ipairs(active_manifest_sides()) do
+			local _, resolved = side_archive_version(side, file_name)
+			add(resolved)
+			for _, dep_name in ipairs(side.dep_lists[file_name] or {}) do
+				local _, dep_resolved = side_archive_version(side, dep_name)
+				add(dep_resolved)
+			end
+		end
+	end
+	return names
+end
+
+---@param archive_name string
+---@return string?
+local function get_saved_version(archive_name)
+	local direct = M.saved_list[archive_name]
+	if direct then
+		return direct
+	end
+	for _, side in ipairs(active_manifest_sides()) do
+		local pack = side.merged_into[archive_name]
+		if pack and M.saved_list[pack] then
+			return M.saved_list[pack]
+		end
+	end
+	return nil
+end
+
+---@param archive_name string
+---@return boolean
+local function archive_awaits_high(archive_name)
+	local low_version, high_version = get_actual_versions(archive_name)
+	if not high_version or high_version == low_version then
+		return false
+	end
+	return get_saved_version(archive_name) ~= high_version
 end
 
 ---@param module liveupdater.module
@@ -632,16 +1136,8 @@ end
 ---@param file_name string
 ---@return boolean
 local function remove_mount_and_local_file(file_name)
-	local name = hash(file_name)
-	for _, mount in ipairs(liveupdate.get_mounts()) do
-		if mount.name == name then
-			if liveupdate.remove_mount(file_name) == liveupdate.LIVEUPDATE_OK then
-				break
-			else
-				log.error("Unable to remove mount %s", file_name)
-				return false
-			end
-		end
+	if not remove_engine_mount(file_name) then
+		return false
 	end
 	local result, err = remove_local_file(file_name)
 	if not result then
@@ -652,15 +1148,238 @@ local function remove_mount_and_local_file(file_name)
 	return true
 end
 
+---@class liveupdater.cache_check_entry
+---@field file_name string
+---@field version string
+---@field md5 string
+---@field chunk_size integer
+---@field size integer
+
+---@type liveupdater.cache_check_entry[]
+local cache_check_list = {}
+local cache_check_generation = 0
+local cache_check_started = false
+local CACHE_CHECK_START_DELAY = 10
+local CACHE_CHECK_IDLE_DELAY = 1
+
+---@param filename string
+---@return boolean
+local function drop_for_failed_md5(filename)
+	local state = cache_md5[filename]
+	if not state or not state.failed then
+		return false
+	end
+	if state.md5 ~= get_expected_md5(filename, M.saved_list[filename]) then
+		cache_md5[filename] = nil
+		return false
+	end
+	state.failed = nil
+	state.retried = true
+	return true
+end
+
+---@param filename string
+local function queue_cache_check(filename)
+	if not verify_hashes then
+		return
+	end
+	local version = M.saved_list[filename]
+	local expected, chunk_size, size = get_expected_md5(filename, version)
+	if not version or not expected or not chunk_size or chunk_size <= 0 or not size then
+		return
+	end
+	local state = cache_md5[filename]
+	if state and state.ok and state.md5 == expected then
+		return
+	end
+	table.insert(
+		cache_check_list,
+		{ file_name = filename, version = version, md5 = expected, chunk_size = chunk_size, size = size }
+	)
+end
+
+---@param entry liveupdater.cache_check_entry
+---@param actual string
+local function finish_cache_check(entry, actual)
+	if M.saved_list[entry.file_name] ~= entry.version then
+		return
+	end
+	if md5_accepted(entry.md5, actual) then
+		cache_md5[entry.file_name] = { md5 = entry.md5, ok = true }
+		return
+	end
+	local state = cache_md5[entry.file_name]
+	if state and state.retried and state.md5 == entry.md5 then
+		log.error(
+			"Cached archive md5 mismatch after redownload %s: expected=%s got=%s",
+			entry.file_name,
+			entry.md5,
+			actual
+		)
+		cache_md5[entry.file_name] = { md5 = entry.md5, ok = true }
+		return
+	end
+	log.warn(
+		"Cached archive md5 mismatch %s: expected=%s got=%s, redownload on next start",
+		entry.file_name,
+		entry.md5,
+		actual
+	)
+	cache_md5[entry.file_name] = { md5 = entry.md5, failed = true }
+end
+
+local function run_cache_check()
+	local generation = cache_check_generation
+	local index = 1
+	local total_bytes = 0
+	local total_ms = 0
+	---@type liveupdater.cache_check_entry?
+	local entry = nil
+	---@type file?
+	local file = nil
+	---@type string[]
+	local parts = {}
+	local left = 0
+
+	local function close_file()
+		if file then
+			file:close()
+			file = nil
+		end
+		entry = nil
+	end
+
+	local function step()
+		if generation ~= cache_check_generation then
+			close_file()
+			return
+		end
+		if next(in_flight) or mount_queue[1] or mount_busy then
+			close_file()
+			timer.delay(CACHE_CHECK_IDLE_DELAY, false, step)
+			return
+		end
+		local deadline = socket.gettime() + POST_BUDGET_SEC
+		repeat
+			if not entry then
+				entry = cache_check_list[index]
+				if not entry then
+					save_local_files_list()
+					M.bench_mark(
+						"cache_md5",
+						string.format("files=%d bytes=%d ms=%.1f", index - 1, total_bytes, total_ms)
+					)
+					cache_check_list = {}
+					return
+				end
+				parts = {}
+				left = entry.size
+				if M.saved_list[entry.file_name] == entry.version then
+					file = io.open(get_local_path(entry.file_name), "rb")
+				end
+				if not file then
+					entry = nil
+					index = index + 1
+				end
+			end
+			if entry and file then
+				local t0 = socket.gettime()
+				local chunk = left > 0 and file:read(math.min(entry.chunk_size, left))
+				if chunk then
+					left = left - #chunk
+					parts[#parts + 1] = hashmd5(chunk)
+					total_bytes = total_bytes + #chunk
+				else
+					local done = entry
+					close_file()
+					finish_cache_check(done, hashmd5(table.concat(parts)))
+					index = index + 1
+				end
+				total_ms = total_ms + (socket.gettime() - t0) * 1000
+			end
+		until socket.gettime() >= deadline
+		timer.delay(0, false, step)
+	end
+
+	step()
+end
+
+local function start_cache_check()
+	if cache_check_started or not cache_check_list[1] then
+		return
+	end
+	cache_check_started = true
+	local generation = cache_check_generation
+	timer.delay(CACHE_CHECK_START_DELAY, false, function()
+		if generation == cache_check_generation then
+			run_cache_check()
+		end
+	end)
+end
+
+---@param filename string
+---@return integer?
+local function local_file_size(filename)
+	local file = io.open(get_local_path(filename), "rb")
+	if not file then
+		return nil
+	end
+	local size = file:seek("end")
+	file:close()
+	return size
+end
+
+local function restore_staged_high()
+	if staged_restored then
+		return
+	end
+	staged_restored = true
+	if not next(staged_versions) then
+		return
+	end
+	for file_name, version in pairs(staged_versions) do
+		local pending_name = file_name .. REMOUNT_PENDING_SUFFIX
+		local _, high_version = get_actual_versions(file_name)
+		local expected_size = manifest_cache and manifest_cache.high and manifest_cache.high.sizes[file_name] or 0
+		local restored = false
+		if version == high_version and file_exists(pending_name) and local_file_size(pending_name) == expected_size then
+			remove_engine_mount(pending_name)
+			if remove_engine_mount(file_name) then
+				local moved, err = move_local_file(pending_name, file_name)
+				if moved then
+					M.saved_list[file_name] = version
+					restored = true
+					M.bench_mark("staged_restored", "name=" .. file_name)
+				else
+					log.error("Unable to restore staged high %s: %s", file_name, err)
+				end
+			end
+		end
+		if not restored then
+			remove_engine_mount(pending_name)
+			remove_local_file(pending_name)
+		end
+		staged_versions[file_name] = nil
+	end
+	save_local_files_list()
+end
+
 ---Removes stale local files and mounts the up-to-date ones.
 ---@param callback fun(success: boolean, error_text: string?)
 local function sync_local_files(callback)
+	rebuild_mounts_index()
+	restore_staged_high()
+	cache_check_generation = cache_check_generation + 1
+	cache_check_started = false
+	cache_check_list = {}
 	local to_mount = {}
 	local stale = {}
 	local missing = {}
 	for filename, saved_version in pairs(M.saved_list) do
 		local low_version, high_version = get_actual_versions(filename)
 		if saved_version ~= low_version and saved_version ~= high_version then
+			table.insert(stale, filename)
+		elseif drop_for_failed_md5(filename) then
 			table.insert(stale, filename)
 		elseif file_exists(filename) then
 			table.insert(to_mount, filename)
@@ -683,157 +1402,35 @@ local function sync_local_files(callback)
 		end
 	end
 
-	local function mount_next(index)
-		if index > #to_mount then
+	local function mount_next(index, files)
+		if index > #files then
 			callback(true)
 			return
 		end
-		local filename = to_mount[index]
+		local filename = files[index]
 		mount_resource(filename, function(success)
 			if not success then
-				log.error("Mount existing files error: %s", filename)
-				callback(false, "Unable to mount existing valid files")
-				return
+				log.warn("Unable to mount cached archive %s, it will be downloaded again", filename)
+				remove_local_file(filename)
+				set_saved_file_version(filename, nil)
+			else
+				queue_cache_check(filename)
 			end
-			mount_next(index + 1)
+			mount_next(index + 1, files)
 		end)
 	end
 
-	mount_next(1)
+	for filename in pairs(cache_md5) do
+		local low_version, high_version = get_actual_versions(filename)
+		if not low_version and not high_version then
+			cache_md5[filename] = nil
+		end
+	end
+
+	mount_next(1, to_mount)
 end
 
----@param modules table<string, liveupdater.module>
-local function enqueue_modules(modules)
-	assert(manifest_cache, "Liveupdater: manifest cache not built")
-	local low = manifest_cache.low
-	local high = manifest_cache.high
-
-	---@param item liveupdater.queue_item
-	---@param reason string
-	local function add_to_queue(item, reason)
-		local key = item.file_name .. ":" .. item.version
-		local existing = download_queue_index[key]
-		if existing then
-			-- an in-flight item cannot be replaced: its download already runs and
-			-- completion credits its bucket, a swapped entry would only skew accounting
-			if existing.priority <= item.priority or key == in_flight_key then
-				return
-			end
-			-- new item has higher priority (smaller value) — drop the old entry;
-			-- the replacement may come from the other resolution pass, so the
-			-- bytes move between the per-resolution buckets
-			for index, value in ipairs(download_files_queue) do
-				if value == existing then
-					table.remove(download_files_queue, index)
-					break
-				end
-			end
-			local existing_bytes = session_bytes[existing.resolution]
-			existing_bytes.total = existing_bytes.total - existing.size
-		end
-		local item_bytes = session_bytes[item.resolution]
-		item_bytes.total = item_bytes.total + item.size
-		download_queue_order = download_queue_order + 1
-		item.order = download_queue_order
-		item.reason = reason
-		download_queue_index[key] = item
-		table.insert(download_files_queue, item)
-	end
-
-	---@param side liveupdater.manifest_side
-	---@param file_name string
-	---@param base_priority number
-	---@param resolution liveupdater.resolution
-	local function add_dependencies(side, file_name, base_priority, resolution)
-		for _, dep_name in ipairs(side.dep_lists[file_name] or {}) do
-			local saved_dep_version = M.saved_list[dep_name]
-			local dep_version_low = low and low.versions[dep_name]
-			local dep_version_high = high and high.versions[dep_name]
-			local skip_dep = false
-			if
-				saved_dep_version
-				and resolution == "low"
-				and (saved_dep_version == dep_version_low or saved_dep_version == dep_version_high)
-			then
-				skip_dep = true
-			end
-			if saved_dep_version and resolution == "high" and saved_dep_version == dep_version_high then
-				skip_dep = true
-			end
-			if not skip_dep then
-				local version = resolution == "high" and dep_version_high or dep_version_low
-				if version then
-					add_to_queue({
-						file_name = dep_name,
-						priority = base_priority - 0.5,
-						version = version,
-						size = side.sizes[dep_name] or 0,
-						module_name = COMMON_MODULE,
-						path = side.path,
-						prefix = side.prefix,
-						resolution = resolution,
-						remount = resolution == "high",
-					}, string.format("dependency_of=%s", file_name))
-				end
-			end
-		end
-	end
-
-	for module_name, module in pairs(modules) do
-		local available = true
-		if module.by_request then
-			available = false
-		elseif not is_module_available(module_name) then
-			available = false
-		end
-
-		if available then
-			module.processed = true
-			for _, file_name in ipairs(module.files) do
-				local saved_version = M.saved_list[file_name]
-				local low_version = low and low.versions[file_name]
-				local high_version = high and high.versions[file_name]
-				local supports_low, supports_high = get_module_resolutions(module)
-
-				local needs_update = not saved_version
-					or (saved_version ~= low_version and saved_version ~= high_version)
-
-				if supports_low then
-					add_dependencies(low, file_name, module.priority, "low")
-					if low_version and needs_update then
-						add_to_queue({
-							file_name = file_name,
-							priority = module.priority,
-							version = low_version,
-							size = low.sizes[file_name] or 0,
-							module_name = module_name,
-							path = low.path,
-							prefix = low.prefix,
-							resolution = "low",
-						}, "needs_low")
-					end
-				end
-
-				if supports_high then
-					add_dependencies(high, file_name, module.priority + 1000, "high")
-					if high_version and needs_update and (not supports_low or high_version ~= low_version) then
-						add_to_queue({
-							file_name = file_name,
-							priority = module.priority + 1000,
-							version = high_version,
-							size = high.sizes[file_name] or 0,
-							module_name = module_name,
-							path = high.path,
-							prefix = high.prefix,
-							resolution = "high",
-							remount = true,
-						}, "needs_high")
-					end
-				end
-			end
-		end
-	end
-
+local function sort_download_queue()
 	table.sort(download_files_queue, function(a, b)
 		if a.priority == b.priority then
 			return a.order < b.order
@@ -842,20 +1439,313 @@ local function enqueue_modules(modules)
 	end)
 end
 
----@param load_info liveupdater.queue_item
-local function remove_mount(load_info)
-	if load_info.remount then
-		if is_mount_exist(load_info.file_name) then
-			if liveupdate.remove_mount(load_info.file_name) ~= liveupdate.LIVEUPDATE_OK then
-				log.error("Unable to remove mount %s", load_info.file_name)
+---@param modules table<string, liveupdater.module>
+---@param force boolean?
+---@return boolean
+local function enqueue_modules(modules, force)
+	assert(manifest_cache, "Liveupdater: manifest cache not built")
+	local low = manifest_cache.low
+	local high = manifest_cache.high
+	local changed = false
+
+	---@param claims table<string, {priority: number, class: integer}>
+	---@return number priority, integer class
+	local function winning_claim(claims)
+		local best_priority = nil
+		local best_class = nil
+		for _, claim in pairs(claims) do
+			local tighter_priority = best_priority == nil or claim.priority < best_priority
+			local same_priority = best_priority ~= nil and claim.priority == best_priority
+			local tighter_class = same_priority and claim.class < best_class
+			if tighter_priority or tighter_class then
+				best_priority = claim.priority
+				best_class = claim.class
 			end
 		end
-		local remove_local_result, err = remove_local_file(load_info.file_name)
-		if not remove_local_result then
-			log.error("Unable to remove file %s: %s", load_info.file_name, err)
-		end
-		set_saved_file_version(load_info.file_name, nil)
+		return best_priority or 0, best_class or M.DOWNLOAD_CLASS.OTHER
 	end
+
+	---@param item liveupdater.queue_item
+	---@param reason string
+	---@param requester_id string
+	---@param download_class integer M.DOWNLOAD_CLASS.*
+	local function add_to_queue(item, reason, requester_id, download_class)
+		local key = item.file_name .. ":" .. item.version
+		local claims = queue_requesters[key]
+		if not claims then
+			claims = {}
+			queue_requesters[key] = claims
+		end
+		claims[requester_id .. ":" .. item.resolution] = { priority = item.priority, class = download_class }
+		local effective, class = winning_claim(claims)
+		item.priority = effective
+		item.download_class = class
+
+		local existing = download_queue_index[key]
+		if existing then
+			local same = existing.priority == effective and existing.download_class == class
+			existing.priority = effective
+			existing.download_class = class
+			if in_flight[key] or same then
+				return
+			end
+			existing.reason = reason
+			changed = true
+			return
+		end
+		local item_bytes = session_bytes[item.resolution]
+		item_bytes.total = item_bytes.total + item.size
+		download_queue_order = download_queue_order + 1
+		item.order = download_queue_order
+		item.reason = reason
+		download_queue_index[key] = item
+		table.insert(download_files_queue, item)
+		changed = true
+	end
+
+	---@param side liveupdater.manifest_side
+	---@param file_name string
+	---@param base_priority number
+	---@param resolution liveupdater.resolution
+	---@param requester_id string
+	---@param download_class integer M.DOWNLOAD_CLASS.*
+	---@param satisfied_priority number?
+	local function add_dependencies(
+		side,
+		file_name,
+		base_priority,
+		resolution,
+		requester_id,
+		download_class,
+		satisfied_priority
+	)
+		for _, dep_name in ipairs(side.dep_lists[file_name] or {}) do
+			local resolved = resolve_archive_name(side, dep_name)
+			local saved_dep_version = get_saved_version(dep_name)
+			local dep_version_low = side_archive_version(low, dep_name)
+			local dep_version_high = side_archive_version(high, dep_name)
+			local skip_dep = false
+			if
+				saved_dep_version
+				and resolution == M.RESOLUTION.LOW
+				and (saved_dep_version == dep_version_low or saved_dep_version == dep_version_high)
+			then
+				skip_dep = true
+			end
+			if saved_dep_version and resolution == M.RESOLUTION.HIGH and saved_dep_version == dep_version_high then
+				skip_dep = true
+			end
+			if
+				resolution == M.RESOLUTION.HIGH
+				and dep_version_high
+				and staged_versions[resolved] == dep_version_high
+			then
+				skip_dep = true
+			end
+			if not skip_dep then
+				local version = resolution == M.RESOLUTION.HIGH and dep_version_high or dep_version_low
+				local dep_priority = base_priority
+				local dep_class = download_class
+				if satisfied_priority and saved_dep_version and saved_dep_version == dep_version_low then
+					dep_priority = satisfied_priority
+					dep_class = M.DOWNLOAD_CLASS.OTHER
+				end
+				if version then
+					add_to_queue({
+						file_name = resolved,
+						priority = dep_priority - DEPENDENCY_PRIORITY_OFFSET,
+						version = version,
+						size = side.sizes[resolved] or 0,
+						module_name = COMMON_MODULE,
+						path = side.path,
+						prefix = side.prefix,
+						resolution = resolution,
+						remount = resolution == M.RESOLUTION.HIGH,
+					}, string.format("dependency_of=%s", file_name), requester_id, dep_class)
+				end
+			end
+		end
+	end
+
+	for module_name, module in pairs(modules) do
+		local available = true
+		if not force and module.by_request then
+			available = false
+		elseif not is_module_available(module_name) then
+			available = false
+		end
+
+		if available then
+			module.processed = true
+			local low_priority = module.focus_low
+			if low_priority == nil then
+				low_priority = module.priority
+			end
+			local high_priority = module.focus_high
+			if high_priority == nil then
+				high_priority = module.priority + HIGH_PRIORITY_OFFSET
+			end
+			local download_class = M.DOWNLOAD_CLASS.BOOT
+			local blocking = M.PRIORITY[M.PRIORITY_IDS.BLOCKING]
+			if module.focus_low ~= nil and module.focus_high ~= nil then
+				if module.focus_low == blocking.low and module.focus_high == blocking.high then
+					download_class = M.DOWNLOAD_CLASS.BLOCKING
+				else
+					download_class = M.DOWNLOAD_CLASS.OTHER
+				end
+			end
+			local module_low, module_high = get_module_resolutions(module)
+			local satisfied_dep_priority = nil
+			if module.focus_low ~= nil and module_high and not module_low then
+				satisfied_dep_priority = high_priority
+				high_priority = low_priority
+			end
+			for _, file_name in ipairs(module.files) do
+				local saved_version = get_saved_version(file_name)
+				local low_version = side_archive_version(low, file_name)
+				local high_version = side_archive_version(high, file_name)
+				local low_resolved = low and resolve_archive_name(low, file_name) or file_name
+				local high_resolved = high and resolve_archive_name(high, file_name) or file_name
+				local supports_low, supports_high = get_module_resolutions(module)
+
+				local needs_update = not saved_version
+					or (saved_version ~= low_version and saved_version ~= high_version)
+
+				if supports_low then
+					add_dependencies(low, file_name, low_priority, M.RESOLUTION.LOW, module_name, download_class)
+					if low_version then
+						local low_key = low_resolved .. ":" .. low_version
+						if needs_update or download_queue_index[low_key] then
+							add_to_queue({
+								file_name = low_resolved,
+								priority = low_priority,
+								version = low_version,
+								size = low.sizes[low_resolved] or 0,
+								module_name = module_name,
+								path = low.path,
+								prefix = low.prefix,
+								resolution = M.RESOLUTION.LOW,
+							}, "needs_low", module_name, download_class)
+						end
+					end
+				end
+
+				if supports_high then
+					add_dependencies(
+						high,
+						file_name,
+						high_priority,
+						M.RESOLUTION.HIGH,
+						module_name,
+						download_class,
+						satisfied_dep_priority
+					)
+					local high_staged = high_version ~= nil and staged_versions[high_resolved] == high_version
+					if high_version and not high_staged and (not supports_low or high_version ~= low_version) then
+						local high_key = high_resolved .. ":" .. high_version
+						if needs_update or download_queue_index[high_key] then
+							add_to_queue({
+								file_name = high_resolved,
+								priority = high_priority,
+								version = high_version,
+								size = high.sizes[high_resolved] or 0,
+								module_name = module_name,
+								path = high.path,
+								prefix = high.prefix,
+								resolution = M.RESOLUTION.HIGH,
+								remount = true,
+							}, "needs_high", module_name, download_class)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return changed
+end
+
+---@param item liveupdater.queue_item
+---@return string
+local function queue_item_key(item)
+	return item.file_name .. ":" .. item.version
+end
+
+---@param item liveupdater.queue_item
+---@return integer M.DOWNLOAD_CLASS.*
+local function item_download_class(item)
+	return item.download_class or M.DOWNLOAD_CLASS.OTHER
+end
+
+---@return integer boot, integer blocking, integer other, integer total
+local function count_in_flight_classes()
+	local boot, blocking, other = 0, 0, 0
+	for _, state in pairs(in_flight) do
+		if state.phase == M.IN_FLIGHT_PHASE.DOWNLOADING then
+			local class = item_download_class(state.item)
+			if class == M.DOWNLOAD_CLASS.BOOT then
+				boot = boot + 1
+			elseif class == M.DOWNLOAD_CLASS.BLOCKING then
+				blocking = blocking + 1
+			else
+				other = other + 1
+			end
+		end
+	end
+	return boot, blocking, other, boot + blocking + other
+end
+
+---@return integer
+local function mount_queue_pending_bodies()
+	return #mount_queue
+end
+
+---@param item liveupdater.queue_item
+---@return boolean
+local function archive_version_conflict(item)
+	local file_name = item.file_name
+	for _, state in pairs(in_flight) do
+		local other = state.item
+		if other.file_name == file_name and other.version ~= item.version then
+			return true
+		end
+	end
+	for _, job in ipairs(mount_queue) do
+		local other = job.load_info
+		if other.file_name == file_name and other.version ~= item.version then
+			return true
+		end
+	end
+	if mounting_files[file_name] then
+		return true
+	end
+	return false
+end
+
+---@param item liveupdater.queue_item
+---@return boolean
+local function can_start_download(item)
+	if archive_version_conflict(item) then
+		return false
+	end
+	if mount_queue_pending_bodies() >= DISK_POST_QUEUE_LIMIT then
+		return false
+	end
+	local boot_n, blocking_n, other_n, total = count_in_flight_classes()
+	if parallel_downloads <= 1 then
+		return total == 0
+	end
+	local class = item_download_class(item)
+	if class == M.DOWNLOAD_CLASS.BLOCKING then
+		return blocking_n == 0
+	end
+	if class == M.DOWNLOAD_CLASS.BOOT then
+		if other_n > 0 then
+			return false
+		end
+		return boot_n < parallel_downloads
+	end
+	return total == 0
 end
 
 ---@param modules table<string, liveupdater.module>
@@ -874,7 +1764,8 @@ local function check_modules_integrity(modules)
 	end
 
 	for file_name, _ in pairs(all_module_files) do
-		if not reference_side.versions[file_name] then
+		local resolved = resolve_archive_name(reference_side, file_name)
+		if not reference_side.versions[resolved] then
 			local error_text =
 				string.format("The module specifies a file that is not listed in the manifest. Module: %s", file_name)
 			log.warn(error_text)
@@ -883,125 +1774,559 @@ local function check_modules_integrity(modules)
 	end
 
 	for file_name, _ in pairs(reference_side.versions) do
-		if all_module_files[file_name] == nil and not reference_side.dep_set[file_name] then
-			local error_text = string.format(
-				"The manifest lists a file that is not present in the modules. File: %s.collectionc",
-				file_name
-			)
+		if
+			all_module_files[file_name] == nil
+			and not reference_side.dep_set[file_name]
+			and not reference_side.pack_set[file_name]
+		then
+			local error_text =
+				string.format("The manifest lists a file that is not present in the modules. File: %s", file_name)
 			log.warn(error_text)
 			downloadable_missing_files[file_name] = error_text
 		end
 	end
 end
 
+local try_start_load_resources
+local pump_mount_queue
+local schedule_mount_pump
+
+local function finish_queue_item(load_info)
+	local key = queue_item_key(load_info)
+	in_flight[key] = nil
+	download_queue_index[key] = nil
+	queue_requesters[key] = nil
+	for index, value in ipairs(download_files_queue) do
+		if value.file_name == load_info.file_name and value.version == load_info.version then
+			table.remove(download_files_queue, index)
+			break
+		end
+	end
+end
+
+local function maybe_all_loaded()
+	if next(download_files_queue) or next(in_flight) or mount_queue[1] or mount_busy then
+		return
+	end
+	files_load_completed = true
+	notify_event_listeners(M.MSG_ALL_LOADED)
+	log.debug("All global files loaded")
+	M.bench_mark("t_all_mounted")
+	start_cache_check()
+end
+
+---@param file_name string
+---@param module_name string
+local function announce_module_loaded(file_name, module_name)
+	if module_name == COMMON_MODULE then
+		return
+	end
+	if not M.is_module_loaded(module_name) then
+		modules_announced_loaded[module_name] = nil
+		return
+	end
+	if modules_announced_loaded[module_name] then
+		return
+	end
+	modules_announced_loaded[module_name] = true
+	notify_event_listeners(M.MSG_MODULE_LOADED, {
+		file_name = file_name,
+		module_name = module_name,
+	})
+end
+
+---@param file_name string
+---@param module_name string
+local function announce_loaded_after_mount(file_name, module_name)
+	if module_name ~= COMMON_MODULE then
+		announce_module_loaded(file_name, module_name)
+		return
+	end
+	for name in pairs(M.modules) do
+		announce_module_loaded(file_name, name)
+	end
+end
+
 ---@param load_info liveupdater.queue_item
----@param load_resources fun()
-local function add_mount(load_info, load_resources)
+local function on_mount_success(load_info)
+	update_file_progress(load_info.prefix, load_info.file_name, 1, 1)
+	mounting_files[load_info.file_name] = nil
+	set_saved_file_version(load_info.file_name, load_info.version)
+	local res_bytes = session_bytes[load_info.resolution]
+	res_bytes.downloaded = res_bytes.downloaded + load_info.size
+	finish_queue_item(load_info)
+
+	notify_event_listeners(M.MSG_FILE_LOADED, {
+		file_name = load_info.file_name,
+		module_name = load_info.module_name,
+	})
+	announce_loaded_after_mount(load_info.file_name, load_info.module_name)
+
+	schedule_mount_pump()
+	try_start_load_resources()
+	maybe_all_loaded()
+end
+
+---@param load_info liveupdater.queue_item
+local function schedule_mount_retry(load_info)
+	log.error("Unable to mount file %s", load_info.file_name)
+	load_info.mount_attempts = (load_info.mount_attempts or 0) + 1
+	if load_info.mount_attempts >= max_attempts then
+		load_info.mount_attempts = 0
+		mounting_files[load_info.file_name] = nil
+		module_loaded_memo = {}
+		remove_local_file(load_info.file_name)
+		in_flight[queue_item_key(load_info)] = nil
+		timer.delay(RETRY_DELAY, false, try_start_load_resources)
+		schedule_mount_pump()
+		return
+	end
+	timer.delay(RETRY_DELAY, false, function()
+		table.insert(mount_queue, 1, { load_info = load_info })
+		schedule_mount_pump()
+	end)
+end
+
+---@param load_info liveupdater.queue_item
+local function mount_one(load_info)
+	local key = queue_item_key(load_info)
+	local state = in_flight[key]
+	if state then
+		state.phase = M.IN_FLIGHT_PHASE.MOUNTING
+		state.bytes = 0
+	end
+	mount_busy = true
+	local t0 = socket.gettime()
 	mount_resource(load_info.file_name, function(success)
+		log_timing("mount", load_info.file_name, (socket.gettime() - t0) * 1000)
+		mount_busy = false
 		if success then
-			update_file_progress(load_info.prefix, load_info.file_name, 1, 1)
-			set_saved_file_version(load_info.file_name, load_info.version)
-			local res_bytes = session_bytes[load_info.resolution]
-			res_bytes.downloaded = res_bytes.downloaded + load_info.size
-
-			in_flight_key = nil
-			in_flight_bytes = 0
-			download_queue_index[load_info.file_name .. ":" .. load_info.version] = nil
-			for index, value in ipairs(download_files_queue) do
-				if value.file_name == load_info.file_name and value.version == load_info.version then
-					table.remove(download_files_queue, index)
-					break
-				end
-			end
-
-			notify_event_listeners(M.MSG_FILE_LOADED, {
-				file_name = load_info.file_name,
-				module_name = load_info.module_name,
-			})
-			if load_info.module_name ~= COMMON_MODULE and M.is_module_loaded(load_info.module_name) then
-				notify_event_listeners(M.MSG_MODULE_LOADED, {
-					file_name = load_info.file_name,
-					module_name = load_info.module_name,
-				})
-			end
-
-			if next(download_files_queue) then
-				load_resources()
-			else
-				files_load_completed = true
-				notify_event_listeners(M.MSG_ALL_LOADED)
-				log.debug("All global files loaded")
-			end
+			on_mount_success(load_info)
 		else
-			log.error("Unable to mount file %s", load_info.file_name)
-			timer.delay(5, false, load_resources)
+			schedule_mount_retry(load_info)
 		end
 	end)
 end
 
----@param success boolean
----@param data string?
 ---@param load_info liveupdater.queue_item
----@param load_resources fun()
-local function handle_load_info_callback(success, data, load_info, load_resources)
-	if success then
-		remove_mount(load_info)
-		---@cast data -?
-		local result, err = save_file(load_info.file_name, data)
-		if result then
-			add_mount(load_info, load_resources)
-		else
-			log.error("Unable to save file %s: %s", load_info.file_name, err)
-			timer.delay(5, false, load_resources)
+local function finish_staged_download(load_info)
+	mounting_files[load_info.file_name] = nil
+	remount_pending[load_info.file_name] = nil
+	finish_queue_item(load_info)
+	notify_event_listeners(M.MSG_FILE_LOADED, {
+		file_name = load_info.file_name,
+		module_name = load_info.module_name,
+	})
+	schedule_mount_pump()
+	try_start_load_resources()
+	maybe_all_loaded()
+end
+
+---@param load_info liveupdater.queue_item
+---@param dl_name string
+local function stage_high_below(load_info, dl_name)
+	local file_name = load_info.file_name
+	if staged_high[file_name] then
+		remove_local_file(dl_name)
+		finish_staged_download(load_info)
+		return
+	end
+
+	local pending_name = file_name .. REMOUNT_PENDING_SUFFIX
+	local low_mount = mounts_by_hash[hash(file_name)]
+	local below = low_mount and (low_mount.priority - 1) or -1
+
+	mounting_files[file_name] = true
+	remount_pending[file_name] = pending_name
+	module_loaded_memo = {}
+
+	local t_save = socket.gettime()
+	local saved, err = move_local_file(dl_name, pending_name)
+	log_timing("save", pending_name, (socket.gettime() - t_save) * 1000)
+	if not saved then
+		log.error("Unable to stage high %s: %s", pending_name, err)
+		mounting_files[file_name] = nil
+		remount_pending[file_name] = nil
+		in_flight[queue_item_key(load_info)] = nil
+		timer.delay(RETRY_DELAY, false, try_start_load_resources)
+		schedule_mount_pump()
+		return
+	end
+
+	local function remember(mounted)
+		staged_high[file_name] = {
+			load_info = load_info,
+			pending_name = pending_name,
+			mounted = mounted,
+		}
+		staged_versions[file_name] = load_info.version
+		save_local_files_list()
+		log.debug("Staged high under pinned low %s", file_name)
+		finish_staged_download(load_info)
+	end
+
+	if below < 0 then
+		remember(false)
+		return
+	end
+
+	mount_busy = true
+	local pending_uri = zip_mount_uri(pending_name)
+	if is_mount_exist(pending_name) then
+		remove_engine_mount(pending_name)
+	end
+	local t_mount = socket.gettime()
+	liveupdate.add_mount(pending_name, pending_uri, below, function(_, _, _, result)
+		log_timing("mount", pending_name, (socket.gettime() - t_mount) * 1000)
+		mount_busy = false
+		if result ~= liveupdate.LIVEUPDATE_OK then
+			log.error("Unable to mount staged high %s", pending_name)
+			remember(false)
+			return
 		end
+		register_mount(pending_name, pending_uri, below)
+		remember(true)
+	end)
+end
+
+local pump_promote
+local promote_failed = false
+
+---@param file_name string
+local function fail_promote(file_name)
+	staged_high[file_name] = nil
+	staged_versions[file_name] = nil
+	promote_failed = true
+	mount_busy = false
+	pump_promote()
+end
+
+---@param staged liveupdater.staged_high
+---@param cb fun()
+local function promote_one(staged, cb)
+	local load_info = staged.load_info
+	local file_name = load_info.file_name
+	local pending_name = staged.pending_name
+	staged.attempts = (staged.attempts or 0) + 1
+	if staged.attempts > 2 then
+		log.error("Giving up high promote for %s", file_name)
+		fail_promote(file_name)
+		return
+	end
+	if not file_exists(pending_name) then
+		log.error("Staged high missing on disk %s", pending_name)
+		fail_promote(file_name)
+		return
+	end
+
+	mount_busy = true
+	if staged.mounted then
+		remove_engine_mount(pending_name)
+	end
+	remove_engine_mount(file_name)
+
+	local t_save = socket.gettime()
+	local saved, err = move_local_file(pending_name, file_name)
+	log_timing("save", file_name, (socket.gettime() - t_save) * 1000)
+	if not saved then
+		log.error("Unable to promote high %s: %s", file_name, err)
+		mount_busy = false
+		staged.mounted = false
+		timer.delay(RETRY_DELAY, false, function()
+			promote_one(staged, cb)
+		end)
+		return
+	end
+
+	local function promoted()
+		staged_versions[file_name] = nil
+		set_saved_file_version(file_name, load_info.version)
+		staged_high[file_name] = nil
+		notify_event_listeners(M.MSG_FILE_LOADED, {
+			file_name = file_name,
+			module_name = load_info.module_name,
+		})
+		cb()
+	end
+
+	local final_uri = zip_mount_uri(file_name)
+	local priority = get_next_priority()
+	liveupdate.add_mount(file_name, final_uri, priority, function(_, _, _, result)
+		if result == liveupdate.LIVEUPDATE_OK then
+			register_mount(file_name, final_uri, priority)
+			mount_busy = false
+			promoted()
+			return
+		end
+		log.error("Unable to mount promoted high %s", file_name)
+		mount_resource(file_name, function(ok)
+			mount_busy = false
+			if ok then
+				promoted()
+			else
+				fail_promote(file_name)
+			end
+		end)
+	end)
+end
+
+local promote_waiting = false
+
+pump_promote = function()
+	if mount_busy then
+		if not promote_waiting then
+			promote_waiting = true
+			timer.delay(0, false, function()
+				promote_waiting = false
+				pump_promote()
+			end)
+		end
+		return
+	end
+	local job = table.remove(promote_jobs, 1)
+	if not job then
+		local cb = promote_on_done
+		local ok = not promote_failed
+		promote_on_done = nil
+		promote_failed = false
+		if cb then
+			cb(ok)
+		end
+		schedule_mount_pump()
+		try_start_load_resources()
+		return
+	end
+	promote_one(job, pump_promote)
+end
+
+---@param load_info liveupdater.queue_item
+---@return boolean
+local function is_obsolete_low_write(load_info)
+	if load_info.resolution ~= M.RESOLUTION.LOW then
+		return false
+	end
+	local file_name = load_info.file_name
+	local _, high_version = get_actual_versions(file_name)
+	if high_version and get_saved_version(file_name) == high_version then
+		return true
+	end
+	if staged_high[file_name] or remount_pending[file_name] then
+		return true
+	end
+	for _, state in pairs(in_flight) do
+		local other = state.item
+		if other.file_name == file_name and other.resolution == M.RESOLUTION.HIGH then
+			return true
+		end
+	end
+	for _, job in ipairs(mount_queue) do
+		local other = job.load_info
+		if other.file_name == file_name and other.resolution == M.RESOLUTION.HIGH then
+			return true
+		end
+	end
+	return false
+end
+
+---@param load_info liveupdater.queue_item
+---@param dl_name string
+---@return boolean
+local function download_size_matches(load_info, dl_name)
+	local expected = load_info.size
+	if not expected or expected <= 0 then
+		return true
+	end
+	local file = io.open(get_local_path(dl_name), "rb")
+	if not file then
+		return false
+	end
+	local actual = file:seek("end")
+	file:close()
+	if actual ~= expected then
+		log.warn("Download size mismatch for %s: expected=%d got=%s", load_info.file_name, expected, tostring(actual))
+		return false
+	end
+	return true
+end
+
+---@param job liveupdater.mount_job
+local function fail_verify_and_redownload(job)
+	local load_info = job.load_info
+	local key = queue_item_key(load_info)
+	if job.dl_name then
+		remove_local_file(job.dl_name)
+	end
+	load_info.verify_attempts = (load_info.verify_attempts or 0) + 1
+	in_flight[key] = nil
+	if load_info.verify_attempts < max_attempts then
+		timer.delay(0, false, try_start_load_resources)
+	else
+		local backoff = math.min(RETRY_DELAY * 2 ^ (load_info.verify_attempts - max_attempts), MAX_RETRY_DELAY)
+		load_info.retry_at = socket.gettime() + backoff
+		notify_event_listeners(M.MSG_NETWORK_ERROR)
+		timer.delay(backoff, false, try_start_load_resources)
+	end
+	schedule_mount_pump()
+end
+
+pump_mount_queue = function()
+	if mount_busy or not mount_queue[1] then
+		return
+	end
+	local job = table.remove(mount_queue, 1)
+	local load_info = job.load_info
+	local key = queue_item_key(load_info)
+	local dl_name = job.dl_name
+	if dl_name and is_obsolete_low_write(load_info) then
+		remove_local_file(dl_name)
+		finish_queue_item(load_info)
+		schedule_mount_pump()
+		try_start_load_resources()
+		maybe_all_loaded()
+		return
+	end
+
+	if dl_name and not job.size_ok then
+		if not download_size_matches(load_info, dl_name) then
+			fail_verify_and_redownload(job)
+			return
+		end
+		job.size_ok = true
+	end
+
+	if dl_name then
+		if load_info.remount and is_mount_exist(load_info.file_name) and pinned_archives[load_info.file_name] then
+			stage_high_below(load_info, dl_name)
+			return
+		end
+		if load_info.remount then
+			mounting_files[load_info.file_name] = true
+			module_loaded_memo = {}
+			-- mount_resource skips an existing mount with the same uri, so the low copy has to go first
+			remove_engine_mount(load_info.file_name)
+			remove_local_file(load_info.file_name)
+		end
+		local t_save = socket.gettime()
+		local result, err = move_local_file(dl_name, load_info.file_name)
+		log_timing("save", load_info.file_name, (socket.gettime() - t_save) * 1000)
+		if not result then
+			log.error("Unable to place file %s: %s", load_info.file_name, err)
+			mounting_files[load_info.file_name] = nil
+			in_flight[key] = nil
+			timer.delay(RETRY_DELAY, false, try_start_load_resources)
+			schedule_mount_pump()
+			return
+		end
+	end
+	mount_one(load_info)
+end
+
+schedule_mount_pump = function()
+	if mount_pump_scheduled then
+		return
+	end
+	mount_pump_scheduled = true
+	timer.delay(0, false, function()
+		mount_pump_scheduled = false
+		pump_mount_queue()
+	end)
+end
+
+---@param success boolean
+---@param dl_name string?
+---@param load_info liveupdater.queue_item
+local function handle_load_info_callback(success, dl_name, load_info)
+	local key = queue_item_key(load_info)
+	if success then
+		if is_obsolete_low_write(load_info) then
+			if dl_name then
+				remove_local_file(dl_name)
+			end
+			finish_queue_item(load_info)
+			try_start_load_resources()
+			maybe_all_loaded()
+			return
+		end
+		table.insert(mount_queue, { load_info = load_info, dl_name = dl_name })
+		local state = in_flight[key]
+		if state then
+			state.phase = M.IN_FLIGHT_PHASE.MOUNTING
+			state.bytes = 0
+		end
+		schedule_mount_pump()
+		try_start_load_resources()
 	else
 		notify_event_listeners(M.MSG_NETWORK_ERROR)
-		timer.delay(5, false, load_resources)
+		in_flight[key] = nil
+		timer.delay(RETRY_DELAY, false, try_start_load_resources)
 	end
 end
 
-local function try_start_load_resources()
-	---@type liveupdater.queue_item?
-	local load_info = download_files_queue[1]
-	if load_info then
-		in_flight_key = load_info.file_name .. ":" .. load_info.version
-		in_flight_bytes = 0
+---@param load_info liveupdater.queue_item
+local function start_download(load_info)
+	local key = queue_item_key(load_info)
+	in_flight[key] = {
+		item = load_info,
+		bytes = 0,
+		phase = M.IN_FLIGHT_PHASE.DOWNLOADING,
+	}
 
-		local callback = function(success, data)
-			handle_load_info_callback(success, data, load_info, try_start_load_resources)
+	local callback = function(success, dl_name)
+		handle_load_info_callback(success, dl_name, load_info)
+	end
+
+	---@param bytes_received number
+	---@param bytes_total number
+	local progress_callback = function(bytes_received, bytes_total)
+		local state = in_flight[key]
+		if state and load_info.size > 0 then
+			state.bytes = math.min(bytes_received, load_info.size)
 		end
+		if bytes_total > 0 then
+			update_file_progress(
+				load_info.prefix,
+				load_info.file_name,
+				math.min(bytes_received / bytes_total, 0.999),
+				1
+			)
+		end
+	end
 
-		---@param bytes_received number
-		---@param bytes_total number
-		local progress_callback = function(bytes_received, bytes_total)
-			if load_info.size > 0 then
-				in_flight_bytes = math.min(bytes_received, load_info.size)
-			end
-			if bytes_total > 0 then
-				-- 100 is reserved for a completed mount, live transfer caps just below
-				update_file_progress(
-					load_info.prefix,
-					load_info.file_name,
-					math.min(bytes_received / bytes_total, 0.999),
-					1
-				)
+	request_archive_file(
+		load_info.prefix,
+		load_info.path,
+		build_archive_filename(load_info.file_name, load_info.version),
+		load_info.file_name,
+		callback,
+		nil,
+		load_info.version,
+		progress_callback
+	)
+end
+
+try_start_load_resources = function()
+	local started = false
+	local now = socket.gettime()
+	for _, load_info in ipairs(download_files_queue) do
+		local key = queue_item_key(load_info)
+		local waiting_retry = load_info.retry_at and load_info.retry_at > now
+		if not in_flight[key] and not waiting_retry and can_start_download(load_info) then
+			start_download(load_info)
+			started = true
+			if parallel_downloads <= 1 then
+				return
 			end
 		end
-
-		request_data(
-			load_info.prefix,
-			load_info.path,
-			build_archive_filename(load_info.file_name, load_info.version),
-			load_info.file_name,
-			callback,
-			nil,
-			load_info.version,
-			progress_callback
-		)
-	else
-		in_flight_key = nil
-		in_flight_bytes = 0
+	end
+	if
+		not started
+		and not next(download_files_queue)
+		and not next(in_flight)
+		and not mount_queue[1]
+		and not mount_busy
+	then
 		files_load_completed = true
+		start_cache_check()
 	end
 end
 
@@ -1010,6 +2335,7 @@ end
 local function initialize_from_manifests(manifest_group, cb)
 	manifest_cache = build_manifest_cache(manifest_group)
 	module_loaded_memo = {}
+	modules_announced_loaded = {}
 
 	sync_local_files(function(success, error_text)
 		if not success then
@@ -1020,11 +2346,22 @@ local function initialize_from_manifests(manifest_group, cb)
 		download_files_queue = {}
 		download_queue_index = {}
 		download_queue_order = 0
-		in_flight_key = nil
-		in_flight_bytes = 0
+		queue_requesters = {}
+		in_flight = {}
+		mount_queue = {}
+		mount_busy = false
+		mounting_files = {}
+		remount_pending = {}
+		pinned_archives = {}
+		pinned_modules = {}
+		staged_high = {}
+		promote_jobs = {}
+		promote_on_done = nil
 		session_bytes.low = { total = 0, downloaded = 0 }
 		session_bytes.high = { total = 0, downloaded = 0 }
-		enqueue_modules(M.modules)
+		if enqueue_modules(M.modules) then
+			sort_download_queue()
+		end
 
 		check_modules_integrity(M.modules)
 
@@ -1048,6 +2385,40 @@ function M.has_module(module_name)
 	return M.modules[module_name] ~= nil
 end
 
+---@param archive_name string
+---@return boolean
+local function archive_file_exists(archive_name)
+	if file_exists(archive_name) then
+		return true
+	end
+	local pending = remount_pending[archive_name]
+	if pending and file_exists(pending) then
+		return true
+	end
+	for _, side in ipairs(active_manifest_sides()) do
+		local pack = side.merged_into[archive_name]
+		if pack and file_exists(pack) then
+			return true
+		end
+	end
+	return false
+end
+
+---@param archive_name string
+---@return boolean
+local function archive_is_mounting(archive_name)
+	if mounting_files[archive_name] then
+		return true
+	end
+	for _, side in ipairs(active_manifest_sides()) do
+		local pack = side.merged_into[archive_name]
+		if pack and mounting_files[pack] then
+			return true
+		end
+	end
+	return false
+end
+
 ---@param module liveupdater.module
 ---@return boolean
 local function compute_module_loaded(module)
@@ -1055,8 +2426,11 @@ local function compute_module_loaded(module)
 	local supports_low, supports_high = get_module_resolutions(module)
 
 	for _, file_name in ipairs(module.files) do
-		local saved_version = M.saved_list[file_name]
-		if not saved_version or not file_exists(file_name) then
+		if archive_is_mounting(file_name) and not remount_pending[file_name] then
+			return false
+		end
+		local saved_version = get_saved_version(file_name)
+		if not saved_version or not archive_file_exists(file_name) then
 			return false
 		end
 
@@ -1069,7 +2443,10 @@ local function compute_module_loaded(module)
 
 		local side = matches_high and cache.high or cache.low
 		for _, dep_name in ipairs(side.dep_lists[file_name] or {}) do
-			local dep_saved_version = M.saved_list[dep_name]
+			if archive_is_mounting(dep_name) and not remount_pending[dep_name] then
+				return false
+			end
+			local dep_saved_version = get_saved_version(dep_name)
 			local dep_low_version, dep_high_version = get_actual_versions(dep_name)
 			local dep_valid = dep_saved_version
 				and (dep_saved_version == dep_high_version or dep_saved_version == dep_low_version)
@@ -1253,6 +2630,8 @@ local function build_idle_progress(forced_progress)
 	local result = build_progress(0, 0, 0, forced_progress) --[[@as liveupdater.download_progress]]
 	result.low = build_progress(0, 0, 0, forced_progress)
 	result.high = build_progress(0, 0, 0, forced_progress)
+	result.gate = build_progress(0, 0, 0, forced_progress)
+	result.downloading = {}
 	return result
 end
 
@@ -1285,31 +2664,53 @@ function M.get_modules_download_progress(module_names)
 		low = { total = 0, downloaded = 0, pending = 0 },
 		high = { total = 0, downloaded = 0, pending = 0 },
 	}
+	local gate = { total = 0, downloaded = 0, pending = 0 }
 	local counted = {}
+	local counted_gate = {}
+
+	---@param counter {total: number, downloaded: number, pending: number}
+	---@param key string
+	---@param size number
+	---@param done boolean
+	local function add_to_counter(counter, key, size, done)
+		counter.total = counter.total + size
+		if done then
+			counter.downloaded = counter.downloaded + size
+			return
+		end
+		counter.pending = counter.pending + 1
+		local state = in_flight[key]
+		if state and state.phase == M.IN_FLIGHT_PHASE.DOWNLOADING and state.bytes > 0 then
+			counter.downloaded = counter.downloaded + math.min(state.bytes, size)
+		end
+	end
 
 	---@param archive_name string
 	---@param side liveupdater.manifest_side
 	---@param done boolean
-	local function count_archive(archive_name, side, done)
+	---@param gating boolean
+	---@param gate_done boolean?
+	local function count_archive(archive_name, side, done, gating, gate_done)
 		local version = side.versions[archive_name]
 		if not version then
 			return
 		end
 		local key = archive_name .. ":" .. version
-		if counted[key] then
-			return
-		end
-		counted[key] = true
 		local size = side.sizes[archive_name]
-		local counter = side == cache.low and counters.low or counters.high
-		counter.total = counter.total + size
-		if done then
-			counter.downloaded = counter.downloaded + size
-		else
-			counter.pending = counter.pending + 1
-			if key == in_flight_key and in_flight_bytes > 0 then
-				counter.downloaded = counter.downloaded + math.min(in_flight_bytes, size)
+		if not counted[key] then
+			counted[key] = true
+			add_to_counter(side == cache.low and counters.low or counters.high, key, size, done)
+		end
+		if gating and not counted_gate[key] then
+			counted_gate[key] = true
+			if gate_done == nil then
+				gate_done = done
 			end
+			local state = in_flight[key]
+			if gate_done and not done and state and state.phase == M.IN_FLIGHT_PHASE.DOWNLOADING then
+				gate_done = false
+			end
+			add_to_counter(gate, key, size, gate_done)
 		end
 	end
 
@@ -1317,36 +2718,45 @@ function M.get_modules_download_progress(module_names)
 	---@param side liveupdater.manifest_side
 	---@return boolean
 	local function is_queued(archive_name, side)
-		local version = side.versions[archive_name]
-		return version ~= nil and download_queue_index[archive_name .. ":" .. version] ~= nil
+		local resolved = resolve_archive_name(side, archive_name)
+		local version = side.versions[resolved]
+		return version ~= nil and download_queue_index[resolved .. ":" .. version] ~= nil
 	end
 
 	---@param side liveupdater.manifest_side
 	---@param file_name string
 	---@param processed boolean?
 	---@param file_actual boolean
-	local function count_file_side(side, file_name, processed, file_actual)
+	---@param gating boolean
+	local function count_file_side(side, file_name, processed, file_actual, gating)
+		local resolved = resolve_archive_name(side, file_name)
 		local done = processed and not is_queued(file_name, side) or not processed and file_actual
-		count_archive(file_name, side, done)
+		count_archive(resolved, side, done, gating)
 		local deps = side.dep_lists[file_name]
 		if not deps then
 			return
 		end
 		for _, dep_name in ipairs(deps) do
+			local dep_resolved = resolve_archive_name(side, dep_name)
 			local dep_done
 			if processed then
 				dep_done = not is_queued(dep_name, side)
 			else
 				-- mirrors skip_dep in enqueue_modules: a highres copy always
 				-- satisfies, a lowres copy satisfies only the lowres pass
-				local dep_saved = M.saved_list[dep_name]
+				local dep_saved = get_saved_version(dep_name)
+				local dep_high = side_archive_version(cache.high, dep_name)
+				local dep_low = side_archive_version(cache.low, dep_name)
 				dep_done = dep_saved ~= nil
-					and (
-						(cache.high ~= nil and dep_saved == cache.high.versions[dep_name])
-						or (side == cache.low and dep_saved == cache.low.versions[dep_name])
-					)
+					and ((cache.high ~= nil and dep_saved == dep_high) or (side == cache.low and dep_saved == dep_low))
 			end
-			count_archive(dep_name, side, dep_done)
+			local dep_saved_any = get_saved_version(dep_name)
+			local dep_satisfied = dep_saved_any ~= nil
+				and (
+					dep_saved_any == side_archive_version(cache.low, dep_name)
+					or dep_saved_any == side_archive_version(cache.high, dep_name)
+				)
+			count_archive(dep_resolved, side, dep_done, gating, dep_done or dep_satisfied)
 		end
 	end
 
@@ -1357,19 +2767,17 @@ function M.get_modules_download_progress(module_names)
 		local processed = module.processed
 
 		for _, file_name in ipairs(module.files) do
-			local saved_version = M.saved_list[file_name]
+			local saved_version = get_saved_version(file_name)
+			local low_version = side_archive_version(cache.low, file_name)
+			local high_version = side_archive_version(cache.high, file_name)
 			-- same rule as needs_update in enqueue_modules, it gates both resolutions at once
-			local file_actual = saved_version ~= nil
-				and (
-					(cache.low ~= nil and saved_version == cache.low.versions[file_name])
-					or (cache.high ~= nil and saved_version == cache.high.versions[file_name])
-				)
+			local file_actual = saved_version ~= nil and (saved_version == low_version or saved_version == high_version)
 
 			if supports_low then
-				count_file_side(cache.low, file_name, processed, file_actual)
+				count_file_side(cache.low, file_name, processed, file_actual, true)
 			end
 			if supports_high then
-				count_file_side(cache.high, file_name, processed, file_actual)
+				count_file_side(cache.high, file_name, processed, file_actual, not supports_low)
 			end
 		end
 	end
@@ -1379,6 +2787,18 @@ function M.get_modules_download_progress(module_names)
 	local result = build_progress(low.total + high.total, low.downloaded + high.downloaded, low.pending + high.pending) --[[@as liveupdater.download_progress]]
 	result.low = build_progress(low.total, low.downloaded, low.pending)
 	result.high = build_progress(high.total, high.downloaded, high.pending)
+	result.gate = build_progress(gate.total, gate.downloaded, gate.pending)
+	result.downloading = {}
+	for key, state in pairs(in_flight) do
+		if state.phase == M.IN_FLIGHT_PHASE.DOWNLOADING then
+			table.insert(result.downloading, {
+				key = key,
+				size = state.item.size or 0,
+				bytes = state.bytes or 0,
+				in_gate = counted_gate[key] == true,
+			})
+		end
+	end
 	return result
 end
 
@@ -1389,7 +2809,7 @@ function M.get_download_progress()
 	local pending_low = 0
 	local pending_high = 0
 	for _, item in ipairs(download_files_queue) do
-		if item.resolution == "low" then
+		if item.resolution == M.RESOLUTION.LOW then
 			pending_low = pending_low + 1
 		else
 			pending_high = pending_high + 1
@@ -1398,13 +2818,12 @@ function M.get_download_progress()
 
 	local partial_low = 0
 	local partial_high = 0
-	if in_flight_key and in_flight_bytes > 0 then
-		local in_flight_item = download_queue_index[in_flight_key]
-		if in_flight_item then
-			if in_flight_item.resolution == "low" then
-				partial_low = in_flight_bytes
+	for _, state in pairs(in_flight) do
+		if state.phase == M.IN_FLIGHT_PHASE.DOWNLOADING and state.bytes > 0 then
+			if state.item.resolution == M.RESOLUTION.LOW then
+				partial_low = partial_low + state.bytes
 			else
-				partial_high = in_flight_bytes
+				partial_high = partial_high + state.bytes
 			end
 		end
 	end
@@ -1454,8 +2873,29 @@ function M.is_module_in_queue(module_name)
 	return module and module.processed
 end
 
+---@param lane_or_low number M.PRIORITY_IDS.* alone, or the low priority with high_priority
+---@param high_priority number?
+---@return number? low, number? high
+local function focus_priorities(lane_or_low, high_priority)
+	if high_priority == nil then
+		local lane = M.PRIORITY[lane_or_low]
+		if not lane then
+			log.warn("Unknown focus lane: %s", tostring(lane_or_low))
+			return nil
+		end
+		return lane.low, lane.high
+	end
+	if type(lane_or_low) ~= "number" or type(high_priority) ~= "number" then
+		log.warn("focus expects a lane id or low and high priorities")
+		return nil
+	end
+	return lane_or_low, high_priority
+end
+
 ---@param module_name string
-function M.request_module_load(module_name)
+---@param lane_or_low number? M.PRIORITY_IDS.*, or the low priority
+---@param high_priority number? required when lane_or_low is a number
+function M.focus(module_name, lane_or_low, high_priority)
 	if not M.initialized then
 		return
 	end
@@ -1466,14 +2906,284 @@ function M.request_module_load(module_name)
 	if not module then
 		return
 	end
-	if module.by_request and not module.processed then
+
+	local force = false
+	if lane_or_low ~= nil then
+		local low, high = focus_priorities(lane_or_low, high_priority)
+		if low == nil or high == nil then
+			return
+		end
+		if not is_module_available(module_name) then
+			return
+		end
+		force = true
+		if module.processed then
+			local current_low = module.focus_low
+			if current_low == nil then
+				current_low = module.priority
+			end
+			local current_high = module.focus_high
+			if current_high == nil then
+				current_high = module.priority + HIGH_PRIORITY_OFFSET
+			end
+			if low == current_low and high == current_high then
+				return
+			end
+			module.focus_low = low
+			module.focus_high = high
+		else
+			module.focus_low = low
+			module.focus_high = high
+			module.by_request = false
+		end
+	elseif not (module.by_request and not module.processed) then
+		return
+	elseif not is_module_available(module_name) then
+		return
+	else
 		module.by_request = false
-		enqueue_modules({ [module_name] = module })
-		if files_load_completed then
-			files_load_completed = false
-			try_start_load_resources()
+	end
+
+	if enqueue_modules({ [module_name] = module }, force) then
+		sort_download_queue()
+	end
+	if files_load_completed then
+		files_load_completed = false
+	end
+	try_start_load_resources()
+end
+
+---@param module_name string
+function M.request_module_load(module_name)
+	M.focus(module_name)
+end
+
+---@param current {state: integer, position: integer?}?
+---@param state integer M.STATUS.*
+---@param position integer?
+---@return {state: integer, position: integer?}
+local function worse_status(current, state, position)
+	if not current or state < current.state then
+		return { state = state, position = position }
+	end
+	if state == current.state and position and (not current.position or position < current.position) then
+		return { state = current.state, position = position }
+	end
+	return current
+end
+
+---@param item liveupdater.queue_item
+---@return integer?
+local function queue_position(item)
+	for index, value in ipairs(download_files_queue) do
+		if value == item then
+			return index
 		end
 	end
+end
+
+---@param file_name string
+---@param resolution liveupdater.resolution
+---@return integer state, integer? position
+local function archive_status(file_name, resolution)
+	local side = resolution == M.RESOLUTION.LOW and manifest_cache.low or manifest_cache.high
+	local version, resolved = side_archive_version(side, file_name)
+	if not side or not version then
+		return M.STATUS.ABSENT, nil
+	end
+	local key = resolved .. ":" .. version
+	local item = download_queue_index[key]
+	if item then
+		local flight = in_flight[key]
+		local state = M.STATUS.QUEUED
+		if flight then
+			state = flight.phase
+		end
+		return state, queue_position(item)
+	end
+	if archive_is_mounting(file_name) then
+		return M.STATUS.MOUNTING, nil
+	end
+	local saved = get_saved_version(file_name)
+	if saved == version then
+		return M.STATUS.READY, nil
+	end
+	local high_version = side_archive_version(manifest_cache.high, file_name)
+	if resolution == M.RESOLUTION.LOW and saved == high_version then
+		return M.STATUS.READY, nil
+	end
+	local staged = staged_high[resolved]
+	if staged and staged.load_info.version == version then
+		return M.STATUS.READY, nil
+	end
+	return M.STATUS.NOT_REQUESTED, nil
+end
+
+---@param status {state: integer, position: integer?}
+---@param progress liveupdater.resolution_progress
+local function status_with_progress(status, progress)
+	status.total_bytes = progress.total_bytes
+	status.downloaded_bytes = progress.downloaded_bytes
+	status.pending_files = progress.pending_files
+	status.progress = progress.progress
+	return status
+end
+
+---@param module liveupdater.module
+---@param resolution liveupdater.resolution
+---@return {state: integer, position: integer?}
+local function resolution_status(module, resolution)
+	local supports_low, supports_high = get_module_resolutions(module)
+	local supports = (resolution == M.RESOLUTION.LOW and supports_low)
+		or (resolution == M.RESOLUTION.HIGH and supports_high)
+	if not supports then
+		return { state = M.STATUS.ABSENT }
+	end
+	local side = resolution == M.RESOLUTION.LOW and manifest_cache.low or manifest_cache.high
+	if not module.processed then
+		for _, file_name in ipairs(module.files) do
+			if not side or not side.versions[file_name] then
+				return { state = M.STATUS.ABSENT }
+			end
+		end
+		return { state = M.STATUS.NOT_REQUESTED }
+	end
+
+	local status = nil
+	local mounting = false
+	for _, file_name in ipairs(module.files) do
+		local state, position = archive_status(file_name, resolution)
+		mounting = mounting or state == M.STATUS.MOUNTING
+		status = worse_status(status, state, position)
+		for _, dep_name in ipairs((side and side.dep_lists[file_name]) or {}) do
+			local dep_state, dep_position = archive_status(dep_name, resolution)
+			mounting = mounting or dep_state == M.STATUS.MOUNTING
+			status = worse_status(status, dep_state, dep_position)
+		end
+	end
+	status = status or { state = M.STATUS.READY }
+	status.mounting = mounting
+	return status
+end
+
+---@param module_name string
+---@return {state: integer, position: integer?, low: table, high: table}
+function M.get_module_status(module_name)
+	assert(M.initialized, "Liveupdater: not initialized")
+	assert(M.modules, "Liveupdater: modules not initialized")
+	local module = M.modules[module_name]
+	assert(module, "Liveupdater: No such module " .. tostring(module_name))
+
+	if not is_liveupdate_available() then
+		local idle = build_idle_progress()
+		return {
+			state = M.STATUS.READY,
+			low = status_with_progress({ state = M.STATUS.READY }, idle.low),
+			high = status_with_progress({ state = M.STATUS.READY }, idle.high),
+		}
+	end
+	assert(manifest_cache, "Liveupdater: manifest cache not built")
+
+	local progress = M.get_modules_download_progress(module_name)
+
+	local supports_low, supports_high = get_module_resolutions(module)
+	local low = status_with_progress(resolution_status(module, M.RESOLUTION.LOW), progress.low)
+	local high = status_with_progress(resolution_status(module, M.RESOLUTION.HIGH), progress.high)
+	local overall = nil
+	if supports_low then
+		overall = worse_status(overall, low.state, low.position)
+	end
+	if supports_high then
+		overall = worse_status(overall, high.state, high.position)
+	end
+	overall = overall or { state = M.STATUS.ABSENT }
+	return {
+		state = overall.state,
+		position = overall.position,
+		mounting = (low.mounting or high.mounting) and true or false,
+		low = low,
+		high = high,
+	}
+end
+
+---@param module_name string
+function M.pin_module(module_name)
+	if not M.initialized or not is_liveupdate_available() or not M.modules[module_name] then
+		return
+	end
+	if pinned_modules[module_name] then
+		return
+	end
+	local names = module_archive_names(M.modules[module_name])
+	local needs = false
+	for _, name in ipairs(names) do
+		if archive_awaits_high(name) then
+			needs = true
+			break
+		end
+	end
+	if not needs then
+		return
+	end
+	pinned_modules[module_name] = names
+	for _, name in ipairs(names) do
+		pinned_archives[name] = (pinned_archives[name] or 0) + 1
+	end
+end
+
+---@param module_name string
+---@return boolean
+function M.is_high_upgrade_ready(module_name)
+	if not M.initialized or not is_liveupdate_available() or not pinned_modules[module_name] then
+		return false
+	end
+	local waiting = false
+	for _, name in ipairs(pinned_modules[module_name]) do
+		if archive_awaits_high(name) then
+			waiting = true
+			local _, high_version = get_actual_versions(name)
+			local staged = staged_high[name]
+			if archive_is_mounting(name) or not staged or staged.load_info.version ~= high_version then
+				return false
+			end
+		end
+	end
+	return waiting
+end
+
+---Call only after the collection proxy reading this module is unloaded.
+---@param module_name string
+---@param cb fun(ok: boolean)
+function M.promote_module(module_name, cb)
+	local names = pinned_modules[module_name]
+	pinned_modules[module_name] = nil
+	if names then
+		for _, name in ipairs(names) do
+			local left = (pinned_archives[name] or 1) - 1
+			if left > 0 then
+				pinned_archives[name] = left
+			else
+				pinned_archives[name] = nil
+			end
+			local staged = staged_high[name]
+			if staged and not pinned_archives[name] then
+				staged_high[name] = nil
+				promote_jobs[#promote_jobs + 1] = staged
+			end
+		end
+	end
+	if promote_on_done then
+		local previous = promote_on_done
+		promote_on_done = function(ok)
+			previous(ok)
+			if cb then
+				cb(ok)
+			end
+		end
+	else
+		promote_on_done = cb
+	end
+	pump_promote()
 end
 
 return M
