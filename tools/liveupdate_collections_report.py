@@ -226,7 +226,29 @@ def normalize_file_sizes(manifest):
     return sizes
 
 
-def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
+def find_highres_tree(highres_dir, highres_tree=None):
+    """Locate the highres files_tree.json.
+
+    liveupdate_pack.py writes it to dist/output/ (outside the published
+    liveupdate_zip/), i.e. two levels above dist/output/<ver>/liveupdatehighres.
+    """
+    if highres_tree:
+        return Path(highres_tree)
+    for path in (highres_dir / "files_tree.json", highres_dir.parent.parent / "files_tree.json"):
+        if path.exists():
+            return path
+    return None
+
+
+def tree_matches_manifest(tree, manifest):
+    tree_manifest = tree.get("manifest") or {}
+    return (
+        tree_manifest.get("version") == manifest.get("version")
+        and tree_manifest.get("file_versions") == manifest.get("file_versions")
+    )
+
+
+def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None, highres_tree=None):
     highres_dir = Path(highres_dir)
     lowres_dir = Path(lowres_dir) if lowres_dir else None
 
@@ -235,11 +257,26 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
     if lowres_dir and (lowres_dir / "manifest.json").exists():
         low_manifest = load_json(lowres_dir / "manifest.json")
 
+    warnings = []
+
     def read_tree(directory):
         path = directory / "files_tree.json" if directory else None
         return load_json(path).get("zip_files", {}) if path and path.exists() else {}
 
-    high_zip_files = read_tree(highres_dir)
+    high_zip_files = {}
+    high_tree_path = find_highres_tree(highres_dir, highres_tree)
+    if high_tree_path and not high_tree_path.exists():
+        warnings.append(f"{high_tree_path} not found.")
+    elif high_tree_path:
+        high_tree = load_json(high_tree_path)
+        if tree_matches_manifest(high_tree, high_manifest):
+            high_zip_files = high_tree.get("zip_files", {})
+        else:
+            warnings.append(
+                f"{high_tree_path} belongs to another build "
+                f"(version {(high_tree.get('manifest') or {}).get('version')}, "
+                f"highres manifest {high_manifest.get('version')}) — ignored."
+            )
     low_zip_files = read_tree(lowres_dir)
     high_versions = high_manifest.get("file_versions") or {}
     low_versions = (low_manifest or {}).get("file_versions") or {}
@@ -250,7 +287,6 @@ def build_model(highres_dir, lowres_dir, modules_lua=None, dmanifest_path=None):
     high_sizes = normalize_file_sizes(high_manifest)
     low_sizes = normalize_file_sizes(low_manifest) if low_manifest else {}
 
-    warnings = []
     if not high_sizes:
         warnings.append(
             "Highres manifest has no file_sizes — download sizes are unavailable. "
@@ -1128,6 +1164,10 @@ def main():
     parser.add_argument("--lowres", help="lowres liveupdate dir")
     parser.add_argument("--out", help="output HTML path")
     parser.add_argument(
+        "--highres-tree",
+        help="highres files_tree.json (default: <highres>/files_tree.json, then dist/output/files_tree.json)",
+    )
+    parser.add_argument(
         "--modules-lua",
         default="",
         help=(
@@ -1153,7 +1193,9 @@ def main():
             raise SystemExit("No --version-dir/--highres given and none found under dist/output")
 
     highres_dir, lowres_dir = resolve_dirs(args)
-    model = build_model(highres_dir, lowres_dir, args.modules_lua or None, args.dmanifest or None)
+    model = build_model(
+        highres_dir, lowres_dir, args.modules_lua or None, args.dmanifest or None, args.highres_tree or None
+    )
     out_path = default_out(args, highres_dir)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(render_html(model), encoding="utf-8")

@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format is based on
   during promotion and chunking; count content size once per unique hash.
 - Report each resolution's archive/dependency sets separately, including common
   archives present only in lowres.
+- Collections report reads the highres `files_tree.json` from `dist/output/`, where
+  the packer writes it, and ignores a tree whose manifest does not match the build.
+  Per-archive file lists, uncompressed sizes and duplicate analysis were empty.
 - Add offline regressions for stripped manifest URLs, common dependency coverage,
   resolution hash changes, empty bases, media grouping and report totals.
 
